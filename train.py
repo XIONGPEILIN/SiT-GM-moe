@@ -430,7 +430,15 @@ def main(args):
                         samples, _ = samples.chunk(2, dim=0)
                     
                     if vae is not None:
-                        samples = vae.decode(samples / 0.18215).sample
+                        # Decode in chunks to avoid OOM
+                        decoded_samples = []
+                        chunk_size = 8
+                        for i in range(0, samples.shape[0], chunk_size):
+                            chunk = samples[i:i+chunk_size]
+                            decoded_chunk = vae.decode(chunk / 0.18215).sample
+                            decoded_samples.append(decoded_chunk)
+                        samples = torch.cat(decoded_samples, dim=0)
+
                         out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
                         dist.all_gather_into_tensor(out_samples, samples)
                     else:
