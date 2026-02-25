@@ -238,14 +238,14 @@ class Transport:
             jump_loss_per_pixel = jump_loss_elementwise.sum(dim=-1)
             
             # Spatial aggregation via mean_flat to consistently scale with L_flow
-            L_jump = mean_flat(jump_loss_per_pixel).mean()
+            L_jump_raw = mean_flat(jump_loss_per_pixel).mean()
             
-            # Scale jump loss down by 0.2 as requested
-            L_jump = L_jump * 0.2
+            # Scale jump loss down by 0.2 for gradients
+            L_jump_scaled = L_jump_raw * 0.2
             
             terms['loss_flow'] = L_flow
-            terms['loss_jump'] = L_jump
-            terms['loss'] = L_flow + L_jump
+            terms['loss_jump'] = L_jump_raw  # Keep original value for wandb logging
+            terms['loss'] = L_flow + L_jump_scaled
             
         else:
             B, *_, C = xt.shape
