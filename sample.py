@@ -43,9 +43,12 @@ def main(mode, args):
         jump_range=getattr(args, 'jump_range', 4.0),
     ).to(device)
     # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
-    ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
-    state_dict = find_model(ckpt_path)
-    model.load_state_dict(state_dict)
+    if args.ckpt is not None and args.ckpt.lower() == "none":
+        print("Skipping checkpoint loading, using randomly initialized model for testing...")
+    else:
+        ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
+        state_dict = find_model(ckpt_path)
+        model.load_state_dict(state_dict)
     model.eval()  # important!
     transport = create_transport(
         args.path_type,
