@@ -17,19 +17,31 @@ def expand_t_like_x(t, x):
 
 class ICPlan:
     """Linear Coupling Plan"""
-    def __init__(self, sigma=0.0):
+    def __init__(self, sigma=0.0, time_schedule="linear"):
         self.sigma = sigma
+        self.time_schedule = time_schedule
 
     def compute_alpha_t(self, t):
         """Compute the data coefficient along the path"""
+        if getattr(self, "time_schedule", "linear") == "cubic":
+            alpha_t = 1 - (1 - t)**3
+            d_alpha_t = 3 * (1 - t)**2
+            return alpha_t, d_alpha_t
         return t, 1
     
     def compute_sigma_t(self, t):
         """Compute the noise coefficient along the path"""
+        if getattr(self, "time_schedule", "linear") == "cubic":
+            sigma_t = (1 - t)**3
+            d_sigma_t = -3 * (1 - t)**2
+            return sigma_t, d_sigma_t
         return 1 - t, -1
     
     def compute_d_alpha_alpha_ratio_t(self, t):
         """Compute the ratio between d_alpha and alpha"""
+        if getattr(self, "time_schedule", "linear") == "cubic":
+            alpha_t, d_alpha_t = self.compute_alpha_t(t)
+            return d_alpha_t / (alpha_t + 1e-8)
         return 1 / t
 
     def compute_drift(self, x, t):

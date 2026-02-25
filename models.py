@@ -156,7 +156,7 @@ class SiT(nn.Module):
         num_classes=1000,
         learn_sigma=True,
         num_bins=128,
-        jump_range=4.0,
+        jump_range=3.0,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -269,9 +269,26 @@ class SiT(nn.Module):
         eps = torch.cat([half_eps, half_eps], dim=0)
 
         # Paper: "jump models do not have yet an equivalent of CFG"
-        # Use conditional jump head output directly (no CFG extrapolation)
-        cond_rest, _ = torch.split(rest, len(rest) // 2, dim=0)
-        rest = torch.cat([cond_rest, cond_rest], dim=0)
+        # However, physically we can decouple: apply CFG to J_t (where to jump), 
+        # but NOT to lambda_t (jump intensity).
+        cond_rest, uncond_rest = torch.split(rest, len(rest) // 2, dim=0)
+        B_orig, C_out_jump, H, W = cond_rest.shape
+        C_in = self.in_channels
+        bins = self.num_bins
+        
+        cond_rest_reshaped = cond_rest.view(B_orig, C_in, bins + 1, H, W)
+        uncond_rest_reshaped = uncond_rest.view(B_orig, C_in, bins + 1, H, W)
+        
+        # J_t (logits): apply CFG
+        cond_J = cond_rest_reshaped[:, :, :bins]
+        uncond_J = uncond_rest_reshaped[:, :, :bins]
+        CFG_J = uncond_J + cfg_scale * (cond_J - uncond_J)
+        
+        # lambda_t (intensity factor): NO CFG, use conditional
+        CFG_lambda = cond_rest_reshaped[:, :, bins:]
+        
+        half_rest = torch.cat([CFG_J, CFG_lambda], dim=2).view(B_orig, C_out_jump, H, W)
+        rest = torch.cat([half_rest, half_rest], dim=0)
         
         return torch.cat([eps, rest], dim=1)
 

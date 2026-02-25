@@ -73,6 +73,8 @@ def main(mode, args):
         input_size=latent_size,
         num_classes=args.num_classes,
         learn_sigma=learn_sigma,
+        num_bins=getattr(args, 'num_bins', 128),
+        jump_range=getattr(args, 'jump_range', 4.0),
     ).to(device)
     # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
     ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
@@ -227,6 +229,8 @@ if __name__ == "__main__":
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
+    parser.add_argument("--num-bins", type=int, default=128)
+    parser.add_argument("--jump-range", type=float, default=3.0)
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a SiT checkpoint (default: auto-download a pre-trained SiT-XL/2 model).")
 

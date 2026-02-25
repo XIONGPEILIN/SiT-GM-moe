@@ -15,6 +15,12 @@ def mean_flat(x):
     """
     return th.mean(x, dim=list(range(1, len(x.size()))))
 
+def sum_flat(x):
+    """
+    Take the sum over all non-batch dimensions.
+    """
+    return th.sum(x, dim=list(range(1, len(x.size()))))
+
 def log_state(state):
     result = []
     

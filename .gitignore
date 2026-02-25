@@ -8,4 +8,5 @@ pretrained_models
 arXiv-2410.20587v3
 .DS_Store
 *.png
+results_a100
 imagenet_feature

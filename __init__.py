@@ -7,7 +7,6 @@ def create_transport(
     train_eps=None,
     sample_eps=None,
     bregman_type="mse",
-    time_schedule="linear",
 ):
     """function for creating Transport object
     **Note**: model prediction defaults to velocity
@@ -52,7 +51,7 @@ def create_transport(
         sample_eps_new = 1e-3 if train_eps is None else sample_eps
         train_eps, sample_eps = train_eps_new, sample_eps_new
     else: # velocity & [GVP, LINEAR]
-        train_eps = 1e-5 if train_eps is None else train_eps
+        train_eps = 0.01 if train_eps is None else train_eps
         sample_eps = 1e-5 if sample_eps is None else sample_eps
     
     # create flow state
@@ -62,7 +61,6 @@ def create_transport(
         loss_type=loss_type,
         train_eps=train_eps,
         sample_eps=sample_eps,
-        time_schedule=time_schedule,
     )
     state.bregman_type = bregman_type
     

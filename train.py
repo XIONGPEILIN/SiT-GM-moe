@@ -23,6 +23,9 @@ from time import time
 import argparse
 import logging
 import os
+import json
+
+from torch.utils.data import Dataset
 
 from models import SiT_models
 from download import find_model
@@ -35,6 +38,57 @@ import wandb_utils
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
+
+class CustomDataset(Dataset):
+    def __init__(self, features_dir):
+        json_path = os.path.join(features_dir, "file_list.json")
+        if os.path.exists(json_path):
+            print(f"---> Loading file list from {json_path}")
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+            self.features_dir = data['features_dir']
+            self.labels_dir = data['labels_dir']
+            self.features_files = data['features_files']
+            self.labels_files = data['labels_files']
+        else:
+            # Fallback to slow os.listdir
+            L = os.listdir(features_dir)
+            print(f'---> Folders in {features_dir}: {L}')
+            for name in L:
+                if name.endswith('_features'):
+                    self.features_dir = os.path.join(features_dir, name)
+                elif name.endswith('_labels'):
+                    self.labels_dir = os.path.join(features_dir, name)
+
+            # Updated sorting for 0_0.npy style
+            def sort_key(x):
+                try:
+                    parts = x.split('_')
+                    batch_idx = int(parts[0])
+                    rank_idx = int(parts[1].split('.')[0])
+                    return batch_idx * 1000 + rank_idx
+                except:
+                    return x
+
+            self.features_files = sorted(os.listdir(self.features_dir), key=sort_key)
+            self.labels_files = sorted(os.listdir(self.labels_dir), key=sort_key)
+            
+            # Optionally cache to json here for next time?
+            # data = {"features_dir": self.features_dir, "labels_dir": self.labels_dir, ...}
+            # with open(json_path, 'w') as f: json.dump(...)
+
+    def __len__(self):
+        assert len(self.features_files) == len(self.labels_files), \
+            "Number of feature files and label files should be same"
+        return len(self.features_files)
+
+    def __getitem__(self, idx):
+        feature_file = self.features_files[idx]
+        label_file = self.labels_files[idx]
+
+        features = np.load(os.path.join(self.features_dir, feature_file))
+        labels = np.load(os.path.join(self.labels_dir, label_file))
+        return torch.from_numpy(features), torch.from_numpy(labels)
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -137,9 +191,9 @@ def main(args):
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
 
-        entity = os.environ["ENTITY"]
-        project = os.environ["PROJECT"]
         if args.wandb:
+            entity = os.environ.get("ENTITY", "default")
+            project = os.environ.get("PROJECT", "SiT-GM-moe")
             wandb_utils.initialize(args, entity, experiment_name, project)
     else:
         logger = create_logger(None)
@@ -186,17 +240,29 @@ def main(args):
         args.sample_eps
     )  # default: velocity; 
     transport_sampler = Sampler(transport)
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    if args.feature_path is None or args.wandb:
+        vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    else:
+        vae = None
     logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup data:
-    transform = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-    ])
-    dataset = ImageFolder(args.data_path, transform=transform)
+    if args.feature_path is None:
+        transform = transforms.Compose([
+            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+        ])
+        dataset = ImageFolder(args.data_path, transform=transform)
+        if hasattr(logger, 'info'):
+            logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    else:
+        if hasattr(logger, 'info'):
+            logger.info(f"---> Preload Imagenet VAE features at {args.feature_path}...")
+        dataset = CustomDataset(args.feature_path)
+        if hasattr(logger, 'info'):
+            logger.info(f"Dataset contains {len(dataset):,} features ({args.feature_path})")
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -204,16 +270,39 @@ def main(args):
         shuffle=True,
         seed=args.global_seed
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=local_batch_size,
-        shuffle=False,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    if args.feature_path is None:
+        loader = DataLoader(
+            dataset,
+            batch_size=local_batch_size,
+            shuffle=False,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+    else:
+        # Features are pre-batched in .npy files (e.g. 32 per file)
+        # We need to flatten the batch dimension when loading them
+        def custom_collate(batch):
+            # batch is a list of tuples: [(features_b1, labels_b1), (features_b2, labels_b2), ...]
+            features = torch.cat([b[0] for b in batch], dim=0)
+            labels = torch.cat([b[1] for b in batch], dim=0)
+            return features, labels
+            
+        # Calculate how many pre-batched "files" to load per step to reach local_batch_size
+        # Assuming each file has 32 items
+        files_per_batch = max(1, local_batch_size // 32)
+        
+        loader = DataLoader(
+            dataset,
+            batch_size=files_per_batch,
+            shuffle=False,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=custom_collate,
+            drop_last=True
+        )
 
     # Prepare models for training:
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
@@ -224,6 +313,8 @@ def main(args):
     train_steps = 0
     log_steps = 0
     running_loss = 0
+    running_loss_flow = 0
+    running_loss_jump = 0
     start_time = time()
 
     # Labels to condition the model with (feel free to change):
@@ -251,9 +342,15 @@ def main(args):
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
-            with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            if args.feature_path is None:
+                with torch.no_grad():
+                    # Map input images to latent space + normalize latents:
+                    x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            else:
+                # Features are already encoded and scaled if they were generated correctly by fastdit script,
+                # but depending on generation script they might not have the 0.18215 scale applied.
+                # fast-DiT scale 0.18215 is applied during save. We assume they are ready for diffusion.
+                pass
             model_kwargs = dict(y=y)
             loss_dict = transport.training_losses(model, x, model_kwargs)
             loss = loss_dict["loss"].mean()
@@ -264,6 +361,10 @@ def main(args):
 
             # Log loss values:
             running_loss += loss.item()
+            if "loss_flow" in loss_dict:
+                running_loss_flow += loss_dict["loss_flow"].item()
+            if "loss_jump" in loss_dict:
+                running_loss_jump += loss_dict["loss_jump"].item()
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -273,16 +374,31 @@ def main(args):
                 steps_per_sec = log_steps / (end_time - start_time)
                 # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                avg_loss_flow = torch.tensor(running_loss_flow / log_steps, device=device)
+                avg_loss_jump = torch.tensor(running_loss_jump / log_steps, device=device)
+                
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                dist.all_reduce(avg_loss_flow, op=dist.ReduceOp.SUM)
+                dist.all_reduce(avg_loss_jump, op=dist.ReduceOp.SUM)
+                
                 avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                avg_loss_flow = avg_loss_flow.item() / dist.get_world_size()
+                avg_loss_jump = avg_loss_jump.item() / dist.get_world_size()
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f} (Flow: {avg_loss_flow:.4f}, Jump: {avg_loss_jump:.4f}), Train Steps/Sec: {steps_per_sec:.2f}")
                 if args.wandb:
                     wandb_utils.log(
-                        { "train loss": avg_loss, "train steps/sec": steps_per_sec },
+                        { 
+                            "train loss": avg_loss, 
+                            "train loss flow": avg_loss_flow,
+                            "train loss jump": avg_loss_jump,
+                            "train steps/sec": steps_per_sec 
+                        },
                         step=train_steps
                     )
                 # Reset monitoring variables:
                 running_loss = 0
+                running_loss_flow = 0
+                running_loss_jump = 0
                 log_steps = 0
                 start_time = time()
 
@@ -312,11 +428,15 @@ def main(args):
 
                     if use_cfg: #remove null samples
                         samples, _ = samples.chunk(2, dim=0)
-                    samples = vae.decode(samples / 0.18215).sample
-                    out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
-                    dist.all_gather_into_tensor(out_samples, samples)
+                    
+                    if vae is not None:
+                        samples = vae.decode(samples / 0.18215).sample
+                        out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
+                        dist.all_gather_into_tensor(out_samples, samples)
+                    else:
+                        out_samples = None
 
-                if args.wandb:
+                if args.wandb and out_samples is not None:
                     wandb_utils.log_image(out_samples, train_steps)
                 logging.info("Generating EMA samples done.")
 
@@ -330,7 +450,8 @@ def main(args):
 if __name__ == "__main__":
     # Default args here will train SiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-path", type=str, required=True)
+    parser.add_argument("--data-path", type=str, default=None)
+    parser.add_argument("--feature-path", type=str, default=None, help="Path to precomputed VAE features")
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
@@ -348,7 +469,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a custom SiT checkpoint")
     parser.add_argument("--num-bins", type=int, default=128)
-    parser.add_argument("--jump-range", type=float, default=4.0)
+    parser.add_argument("--jump-range", type=float, default=3.0)
     parser.add_argument("--sampler-type", type=str, default="ode",
                         choices=["ode", "jump_flow"])
 

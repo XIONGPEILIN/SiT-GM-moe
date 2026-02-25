@@ -10,6 +10,8 @@ def parse_transport_args(parser):
     group.add_argument("--loss-weight", type=none_or_str, default=None, choices=[None, "velocity", "likelihood"])
     group.add_argument("--sample-eps", type=float)
     group.add_argument("--train-eps", type=float)
+    group.add_argument("--time-schedule", type=str, default="linear", choices=["linear", "cubic"])
+    group.add_argument("--bregman-type", type=str, default="mse", choices=["mse", "cosh", "exp"])
 
 def parse_ode_args(parser):
     group = parser.add_argument_group("ODE arguments")
@@ -18,6 +20,8 @@ def parse_ode_args(parser):
     group.add_argument("--rtol", type=float, default=1e-3, help="Relative tolerance")
     group.add_argument("--reverse", action="store_true")
     group.add_argument("--likelihood", action="store_true")
+    group.add_argument("--jump-alpha-schedule", type=str, default="constant", choices=["constant", "linear"])
+    group.add_argument("--flow-sampler", type=str, default="euler", choices=["euler", "heun"])
 
 def parse_sde_args(parser):
     group = parser.add_argument_group("SDE arguments")

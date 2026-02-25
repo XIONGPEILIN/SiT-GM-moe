@@ -6,7 +6,7 @@ from tqdm import tqdm
 import enum
 
 from . import path
-from .utils import EasyDict, log_state, mean_flat, sum_flat
+from .utils import EasyDict, log_state, mean_flat
 from .integrators import ode, sde
 
 class ModelType(enum.Enum):
@@ -47,7 +47,6 @@ class Transport:
         loss_type,
         train_eps,
         sample_eps,
-        time_schedule="linear",
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -60,7 +59,6 @@ class Transport:
         self.path_sampler = path_options[path_type]()
         self.train_eps = train_eps
         self.sample_eps = sample_eps
-        self.time_schedule = time_schedule
 
     def prior_logp(self, z):
         '''
@@ -145,7 +143,7 @@ class Transport:
             terms = {}
             terms['pred'] = u_theta
             
-            # Flow loss uses mean_flat (MSE) per paper (main.tex:2798)
+            # Flow loss should be averaged spatially to match original SiT
             diff = u_theta - ut
             breg_type = getattr(self, 'bregman_type', 'mse')
             if breg_type == 'cosh':
@@ -158,19 +156,12 @@ class Transport:
             # GM jump objective computation
             t_expand = path.expand_t_like_x(t, xt)
             
-            if getattr(self, "time_schedule", "linear") == "cubic":
-                alpha_t = 1 - (1 - t_expand)**3
-                d_alpha_t = 3 * (1 - t_expand)**2
-            else:
-                alpha_t = t_expand
-                d_alpha_t = 1.0
-
-            # k_func uses strictly the theoretical probability time alpha_t
+            # k_func definition (F17)
             def k_func(val):
-                return val**2 - (alpha_t+1)*val*x1 - (1-alpha_t)**2 + alpha_t*x1**2
+                return val**2 - (t_expand+1)*val*x1 - (1-t_expand)**2 + t_expand*x1**2
             
-            # lambda_target (Chain rule: \lambda_t = d_alpha_t * \lambda_{old}(alpha_t) )
-            lambda_target = th.relu(k_func(xt)) * d_alpha_t / ((1 - alpha_t)**3 + 1e-8)
+            # lambda_target (F14)
+            lambda_target = th.relu(k_func(xt)) / ((1 - t_expand)**3 + 1e-8)
             
             # Fetch num_bins and jump_range from model safely
             has_module = hasattr(model, 'module')
@@ -237,7 +228,7 @@ class Transport:
             
             jump_loss_per_pixel = jump_loss_elementwise.sum(dim=-1)
             
-            # Spatial aggregation via mean_flat to consistently scale with L_flow
+            # Spatial aggregation via mean_flat rather than sum (keeps scale 1:1)
             L_jump = mean_flat(jump_loss_per_pixel).mean()
             
             terms['loss_flow'] = L_flow
@@ -262,9 +253,9 @@ class Transport:
                 raise NotImplementedError()
             
             if self.model_type == ModelType.NOISE:
-                terms['loss'] = mean_flat(weight * ((model_output - x0) ** 2)).mean()
+                terms['loss'] = (weight * ((model_output - x0) ** 2)).flatten(1).sum(dim=1).mean()
             else:
-                terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2)).mean()
+                terms['loss'] = (weight * ((model_output * sigma_t + x0) ** 2)).flatten(1).sum(dim=1).mean()
                 
         return terms
     
@@ -508,10 +499,6 @@ class Sampler:
         num_steps=50,
         reverse=False,
         jump_alpha=0.5,
-        jump_alpha_schedule="constant",
-        flow_sampler="euler",
-        corrector_steps=0,
-        snr=0.1,
     ):
         """returns a sampling function for mixed CTMC/SDE (Algorithm 2)
         Args:
@@ -519,6 +506,8 @@ class Sampler:
         - reverse: whether solving in reverse; default to False
         """
         # Note: Jump logic is currently only valid for forward generation (t=0 to t=1)
+        import transport.path as path
+        import transport.transport as transport
         
         t0, t1 = self.transport.check_interval(
             self.transport.train_eps,
@@ -541,16 +530,9 @@ class Sampler:
             jump_range = getattr(base_model, 'jump_range', 4.0)
             in_channels = getattr(base_model, 'in_channels', x.shape[1])
 
-            for i, ti in tqdm(enumerate(t_list[:-1]), total=len(t_list)-1, desc="Jump Flow Euler (with PC support)"):
+            for i, ti in tqdm(enumerate(t_list[:-1]), total=len(t_list)-1, desc="Jump Flow Euler"):
                 with th.no_grad():
                     t_vec = th.ones(x.shape[0], device=x.device) * ti
-                    
-                    for _ in range(corrector_steps):
-                        score = self.score(x, t_vec, model, **model_kwargs)
-                        noise = th.randn_like(x)
-                        eps = snr * dt
-                        x = x + 0.5 * eps * score + th.sqrt(eps) * noise
-
                     model_output = model(x, t_vec, **model_kwargs)
                     
                     if model_output.shape[1] > in_channels:
@@ -574,19 +556,14 @@ class Sampler:
                         if reverse:
                             raise NotImplementedError("Reverse sampling for Jumps not fully supported.")
                         
-                        if jump_alpha_schedule == "linear":
-                            current_jump_weight = cur_t
-                        else:
-                            current_jump_weight = jump_alpha
-
                         if cur_t + h >= 1.0 - eps_val:
                             # Avoid singularity exactly at t=1
                             R = th.zeros_like(lambda_t)
                         else:
-                            lambda_t_weighted = current_jump_weight * lambda_t
+                            lambda_t_weighted = jump_alpha * lambda_t
                             R_val = 0.5 * lambda_t_weighted * (1 - cur_t) * (1 - ((1 - cur_t)**2) / ((1 - cur_t - h)**2))
                             R = th.exp(R_val)
-
+                        
                         p_jump = th.clamp(1 - R, 0.0, 1.0)
                         m = th.bernoulli(p_jump)
                         
@@ -600,41 +577,20 @@ class Sampler:
                         m = 0
                         jump_vals = 0
                         v_theta = model_output
-                        current_alpha = jump_alpha if jump_alpha_schedule != "linear" else cur_t
 
-                    if self.transport.model_type == ModelType.NOISE:
+                    if self.transport.model_type == transport.ModelType.NOISE:
                         drift_mean, drift_var = self.transport.path_sampler.compute_drift(x, t_vec)
                         sigma_t, _ = self.transport.path_sampler.compute_sigma_t(path.expand_t_like_x(t_vec, x))
                         score = v_theta / -sigma_t
                         c_drift = (-drift_mean + drift_var * score)
-                    elif self.transport.model_type == ModelType.SCORE:
+                    elif self.transport.model_type == transport.ModelType.SCORE:
                         drift_mean, drift_var = self.transport.path_sampler.compute_drift(x, t_vec)
                         c_drift = (-drift_mean + drift_var * v_theta)
                     else:
                         c_drift = v_theta
 
-                    c_drift = c_drift * (1.0 - current_alpha)
+                    c_drift = c_drift * (1.0 - jump_alpha)
                     x_continuous = x + c_drift * dt
-
-                    if flow_sampler == "heun" and i < len(t_list) - 2:
-                        t_vec_next = th.ones(x.shape[0], device=x.device) * t_list[i+1]
-                        model_output_next = model(x_continuous, t_vec_next, **model_kwargs)
-                        v_theta_next = model_output_next[:, :in_channels] if model_output_next.shape[1] > in_channels else model_output_next
-
-                        if self.transport.model_type == ModelType.NOISE:
-                            drift_mean_next, drift_var_next = self.transport.path_sampler.compute_drift(x_continuous, t_vec_next)
-                            sigma_t_next, _ = self.transport.path_sampler.compute_sigma_t(path.expand_t_like_x(t_vec_next, x_continuous))
-                            score_next = v_theta_next / -sigma_t_next
-                            c_drift_next = (-drift_mean_next + drift_var_next * score_next)
-                        elif self.transport.model_type == ModelType.SCORE:
-                            drift_mean_next, drift_var_next = self.transport.path_sampler.compute_drift(x_continuous, t_vec_next)
-                            c_drift_next = (-drift_mean_next + drift_var_next * v_theta_next)
-                        else:
-                            c_drift_next = v_theta_next
-
-                        next_alpha = jump_alpha if jump_alpha_schedule != "linear" else t_list[i+1].item()
-                        c_drift_next = c_drift_next * (1.0 - next_alpha)
-                        x_continuous = x + 0.5 * (c_drift + c_drift_next) * dt
                     
                     if isinstance(m, int) and m == 0:
                         x = x_continuous
@@ -653,11 +609,33 @@ class Sampler:
         snr=0.1,
     ):
         """Predictor-Corrector sampling (Euler predictor + Langevin corrector)"""
-        return self.sample_jump_flow(
-            num_steps=num_steps,
-            corrector_steps=corrector_steps,
-            snr=snr,
+        t0, t1 = self.transport.check_interval(
+            self.transport.train_eps,
+            self.transport.sample_eps,
+            eval=True,
         )
+        t_list = th.linspace(t0, t1, num_steps)
+        dt = t_list[1] - t_list[0]
+        
+        def _sample(init, model, **model_kwargs):
+            x = init
+            xs = [x]
+            for i, ti in tqdm(enumerate(t_list[:-1]), total=len(t_list)-1, desc="PC Sampler"):
+                with th.no_grad():
+                    t_vec = th.ones(x.shape[0], device=x.device) * ti
+                    # Corrector step (Langevin to preserve marginal p_t)
+                    for _ in range(corrector_steps):
+                        score = self.score(x, t_vec, model, **model_kwargs)
+                        noise = th.randn_like(x)
+                        eps = snr * dt
+                        x = x + 0.5 * eps * score + th.sqrt(eps) * noise
+                    
+                    # Predictor step
+                    drift = self.drift(x, t_vec, model, **model_kwargs)
+                    x = x + drift * dt
+                    xs.append(x)
+            return xs
+        return _sample
 
     def sample_ode_likelihood(
         self,
