@@ -555,6 +555,8 @@ class Sampler:
                         x = x + 0.5 * eps * score + th.sqrt(eps) * noise
 
                     model_output = model(x, t_vec, **model_kwargs)
+                    cur_t = ti.item()
+                    current_alpha = jump_alpha if jump_alpha_schedule != "linear" else cur_t
                     
                     if model_output.shape[1] > in_channels:
                         v_theta = model_output[:, :in_channels]
@@ -571,7 +573,6 @@ class Sampler:
                         lambda_t = th.nn.functional.softplus(intensity_logits)
                         
                         eps_val = 1e-5
-                        cur_t = ti.item()
                         h = dt.item()
                         
                         if reverse:
@@ -603,7 +604,6 @@ class Sampler:
                         m = 0
                         jump_vals = 0
                         v_theta = model_output
-                        current_alpha = jump_alpha if jump_alpha_schedule != "linear" else cur_t
 
                     if self.transport.model_type == ModelType.NOISE:
                         drift_mean, drift_var = self.transport.path_sampler.compute_drift(x, t_vec)
