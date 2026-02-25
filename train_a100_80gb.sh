@@ -62,7 +62,7 @@ accelerate launch \
     --epochs 14000 \
     --log-every 10 \
     --ckpt-every 50000 \
-    --sample-every 10000000 \
+    --sample-every 10000000000000000000000000000000000000000000000000000000000000000000000000000 \
     --cfg-scale 4.0 \
     --wandb \
     $CKPT_ARG
