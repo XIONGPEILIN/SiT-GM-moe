@@ -59,7 +59,7 @@ accelerate launch \
     --jump-range $JUMP_RANGE \
     --sampler-type $SAMPLER_TYPE \
     --time-schedule $TIME_SCHEDULE \
-    --epochs 1400 \
+    --epochs 14000 \
     --log-every 10 \
     --ckpt-every 50000 \
     --sample-every 10000 \

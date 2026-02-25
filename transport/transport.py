@@ -240,6 +240,9 @@ class Transport:
             # Spatial aggregation via mean_flat to consistently scale with L_flow
             L_jump = mean_flat(jump_loss_per_pixel).mean()
             
+            # Scale jump loss down by 0.2 as requested
+            L_jump = L_jump * 0.2
+            
             terms['loss_flow'] = L_flow
             terms['loss_jump'] = L_jump
             terms['loss'] = L_flow + L_jump
@@ -553,9 +556,6 @@ class Sampler:
 
                     model_output = model(x, t_vec, **model_kwargs)
                     
-                    cur_t = ti.item()
-                    current_alpha = jump_alpha if jump_alpha_schedule != "linear" else cur_t
-                    
                     if model_output.shape[1] > in_channels:
                         v_theta = model_output[:, :in_channels]
                         jump_head = model_output[:, in_channels:]
@@ -603,8 +603,8 @@ class Sampler:
                         m = 0
                         jump_vals = 0
                         v_theta = model_output
-                        # current_alpha is now defined outside this block
-                        
+                        current_alpha = jump_alpha if jump_alpha_schedule != "linear" else cur_t
+
                     if self.transport.model_type == ModelType.NOISE:
                         drift_mean, drift_var = self.transport.path_sampler.compute_drift(x, t_vec)
                         sigma_t, _ = self.transport.path_sampler.compute_sigma_t(path.expand_t_like_x(t_vec, x))
