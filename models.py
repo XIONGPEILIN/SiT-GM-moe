@@ -155,11 +155,18 @@ class SiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        num_bins=128,
+        jump_range=4.0,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
         self.in_channels = in_channels
-        self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.num_bins = num_bins
+        self.jump_range = jump_range
+        # out_channels = flow_channels + jump_channels
+        # flow_channels = in_channels
+        # jump_channels = in_channels * (num_bins + 1)
+        self.out_channels = in_channels + in_channels * (num_bins + 1)
         self.patch_size = patch_size
         self.num_heads = num_heads
 
@@ -242,8 +249,7 @@ class SiT(nn.Module):
             x = block(x, c)                      # (N, T, D)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
-        if self.learn_sigma:
-            x, _ = x.chunk(2, dim=1)
+        # We don't chunk here because transport loss should handle the splitting of out_channels
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
@@ -256,12 +262,18 @@ class SiT(nn.Module):
         model_out = self.forward(combined, t, y)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
+        # For jump head CFG, we handle it analogously if needed, but standard CFG applied to all channels:
+        eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
+
+        # Apply CFG to jump head as well? For now, we mainly apply it to the flow part, 
+        # or apply to both:
+        cond_rest, uncond_rest = torch.split(rest, len(rest) // 2, dim=0)
+        half_rest = uncond_rest + cfg_scale * (cond_rest - uncond_rest)
+        rest = torch.cat([half_rest, half_rest], dim=0)
+        
         return torch.cat([eps, rest], dim=1)
 
 

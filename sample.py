@@ -80,6 +80,11 @@ def main(mode, args):
             last_step_size=args.last_step_size,
             num_steps=args.num_sampling_steps,
         )
+    elif mode == "MIXED":
+        sample_fn = sampler.sample_jump_flow(
+            num_steps=args.num_sampling_steps,
+            reverse=args.reverse
+        )
     
 
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
@@ -119,7 +124,7 @@ if __name__ == "__main__":
     mode = sys.argv[1]
 
     assert mode[:2] != "--", "Usage: program.py <mode> [options]"
-    assert mode in ["ODE", "SDE"], "Invalid mode. Please choose 'ODE' or 'SDE'"
+    assert mode in ["ODE", "SDE", "MIXED"], "Invalid mode. Please choose 'ODE', 'SDE', or 'MIXED'"
     
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")
@@ -139,6 +144,9 @@ if __name__ == "__main__":
     elif mode == "SDE":
         parse_sde_args(parser)
         # Further processing for SDE
+    elif mode == "MIXED":
+        parse_ode_args(parser)
+        # Further processing for MIXED
     
     args = parser.parse_known_args()[0]
     main(mode, args)

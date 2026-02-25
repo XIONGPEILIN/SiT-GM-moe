@@ -115,6 +115,11 @@ def main(mode, args):
             last_step_size=args.last_step_size,
             num_steps=args.num_sampling_steps,
         )
+    elif mode == "MIXED":
+        sample_fn = sampler.sample_jump_flow(
+            num_steps=args.num_sampling_steps,
+            reverse=args.reverse
+        )
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
     using_cfg = args.cfg_scale > 1.0
@@ -131,6 +136,10 @@ def main(mode, args):
                     f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
                     f"{mode}-{args.num_sampling_steps}-{args.sampling_method}-"\
                     f"{args.diffusion_form}-{args.last_step}-{args.last_step_size}"
+    elif mode == "MIXED":
+        folder_name = f"{model_string_name}-{ckpt_string_name}-" \
+                    f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
+                    f"{mode}-{args.num_sampling_steps}"
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
     if rank == 0:
         os.makedirs(sample_folder_dir, exist_ok=True)
@@ -204,7 +213,7 @@ if __name__ == "__main__":
     mode = sys.argv[1]
     
     assert mode[:2] != "--", "Usage: program.py <mode> [options]"
-    assert mode in ["ODE", "SDE"], "Invalid mode. Please choose 'ODE' or 'SDE'"
+    assert mode in ["ODE", "SDE", "MIXED"], "Invalid mode. Please choose 'ODE', 'SDE', or 'MIXED'"
 
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
@@ -228,6 +237,9 @@ if __name__ == "__main__":
     elif mode == "SDE":
         parse_sde_args(parser)
         # Further processing for SDE
+    elif mode == "MIXED":
+        parse_ode_args(parser)
+        # Further processing for MIXED
 
     args = parser.parse_known_args()[0]
     main(mode, args)

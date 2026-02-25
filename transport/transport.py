@@ -131,14 +131,108 @@ class Transport:
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         model_output = model(xt, t, **model_kwargs)
-        B, *_, C = xt.shape
-        assert model_output.size() == (B, *xt.size()[1:-1], C)
-
-        terms = {}
-        terms['pred'] = model_output
+        
+        C_in = xt.shape[1]
+        
         if self.model_type == ModelType.VELOCITY:
-            terms['loss'] = mean_flat(((model_output - ut) ** 2))
-        else: 
+            # For VELOCITY model, we have incorporated jump head according to gm.md
+            u_theta = model_output[:, :C_in]
+            jump_head = model_output[:, C_in:]
+            
+            terms = {}
+            terms['pred'] = u_theta
+            
+            # Flow loss should be summed spatially according to the paper (D = sum(D_0))
+            L_flow = ((u_theta - ut) ** 2).flatten(1).sum(dim=1).mean()
+            
+            # GM jump objective computation
+            t_expand = path.expand_t_like_x(t, xt)
+            
+            # k_func definition (F17)
+            def k_func(val):
+                return val**2 - (t_expand+1)*val*x1 - (1-t_expand)**2 + t_expand*x1**2
+            
+            # lambda_target (F14)
+            lambda_target = th.relu(k_func(xt)) / ((1 - t_expand)**3 + 1e-8)
+            
+            # Fetch num_bins and jump_range from model safely
+            has_module = hasattr(model, 'module')
+            base_model = model.module if has_module else model
+            num_bins = getattr(base_model, 'num_bins', 128)
+            jump_range = getattr(base_model, 'jump_range', 4.0)
+            
+            y_bins = th.linspace(-jump_range, jump_range, num_bins, device=xt.device)
+            # shape mapping for bins broadcast: (1, 1, 1, 1, num_bins)
+            y_expanded = y_bins.view(*([1]*xt.dim()), num_bins)
+            
+            t_expand_bin = t_expand.unsqueeze(-1)
+            x1_bin = x1.unsqueeze(-1)
+            
+            def k_func_bin(val):
+                return val**2 - (t_expand_bin+1)*val*x1_bin - (1-t_expand_bin)**2 + t_expand_bin*x1_bin**2
+            
+            # J_target for multiple bins (F15)
+            k_val_y = k_func_bin(y_expanded)
+            relu_neg_k_y = th.relu(-k_val_y)
+            
+            mu = t_expand_bin * x1_bin
+            sigma = th.clamp(1 - t_expand_bin, min=1e-5)
+            
+            bin_width = 2.0 * jump_range / max(1, num_bins - 1)
+            y_left = y_expanded - bin_width / 2.0
+            y_right = y_expanded + bin_width / 2.0
+            
+            normal_dist = th.distributions.Normal(mu, sigma)
+            cdf_diff = normal_dist.cdf(y_right) - normal_dist.cdf(y_left)
+            cdf_diff = th.clamp(cdf_diff, min=0.0)
+            
+            J_target_unnorm = relu_neg_k_y * cdf_diff
+            J_target_sum = J_target_unnorm.sum(dim=-1, keepdim=True) + 1e-8
+            J_target = J_target_unnorm / J_target_sum
+            
+            Q_target = lambda_target.unsqueeze(-1) * J_target
+            
+            # Predict
+            jump_head_reshaped = jump_head.view(xt.size(0), C_in, num_bins + 1, *xt.shape[2:])
+            # Transpose to put bins array at the end: (B, C, H, W, num_bins+1)
+            # In pytorch, we can permute. Original: 0=B, 1=C, 2=bins, 3=H, 4=W
+            dims = list(range(jump_head_reshaped.dim()))
+            dims.append(dims.pop(2))
+            jump_head_reshaped = jump_head_reshaped.permute(*dims)
+            
+            logits_b = jump_head_reshaped[..., :num_bins]
+            intensity_logits = jump_head_reshaped[..., num_bins]
+            
+            J_theta = th.softmax(logits_b, dim=-1)
+            lambda_theta = th.nn.functional.softplus(intensity_logits)
+            
+            Q_theta = lambda_theta.unsqueeze(-1) * J_theta
+            
+            # D = sum_{y} [ Q_theta(y;x) - Q(y;x) * log Q_theta(y;x) ]
+            jump_loss_elementwise = Q_theta - Q_target * th.log(Q_theta + 1e-8)
+            
+            # Mask out the bin that equals x (y != x exclusion)
+            xt_expanded = xt.unsqueeze(-1)
+            min_idx = th.argmin(th.abs(y_expanded - xt_expanded), dim=-1, keepdim=True)
+            is_y_not_x = th.ones_like(jump_loss_elementwise)
+            is_y_not_x.scatter_(-1, min_idx, 0.0)
+            jump_loss_elementwise = jump_loss_elementwise * is_y_not_x
+            
+            jump_loss_per_pixel = jump_loss_elementwise.sum(dim=-1)
+            
+            # Spatial aggregation via Sum rather than mean_flat
+            L_jump = jump_loss_per_pixel.flatten(1).sum(dim=1).mean()
+            
+            terms['loss_flow'] = L_flow
+            terms['loss_jump'] = L_jump
+            terms['loss'] = L_flow + L_jump
+            
+        else:
+            B, *_, C = xt.shape
+            assert model_output.size() == (B, *xt.size()[1:-1], C)
+            terms = {}
+            terms['pred'] = model_output
+            
             _, drift_var = self.path_sampler.compute_drift(xt, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, xt))
             if self.loss_type in [WeightType.VELOCITY]:
@@ -151,9 +245,9 @@ class Transport:
                 raise NotImplementedError()
             
             if self.model_type == ModelType.NOISE:
-                terms['loss'] = mean_flat(weight * ((model_output - x0) ** 2))
+                terms['loss'] = (weight * ((model_output - x0) ** 2)).flatten(1).sum(dim=1).mean()
             else:
-                terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
+                terms['loss'] = (weight * ((model_output * sigma_t + x0) ** 2)).flatten(1).sum(dim=1).mean()
                 
         return terms
     
@@ -165,17 +259,23 @@ class Transport:
         def score_ode(x, t, model, **model_kwargs):
             drift_mean, drift_var = self.path_sampler.compute_drift(x, t)
             model_output = model(x, t, **model_kwargs)
+            if model_output.shape[1] > x.shape[1]:
+                model_output = model_output[:, :x.shape[1]]
             return (-drift_mean + drift_var * model_output) # by change of variable
         
         def noise_ode(x, t, model, **model_kwargs):
             drift_mean, drift_var = self.path_sampler.compute_drift(x, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, x))
             model_output = model(x, t, **model_kwargs)
+            if model_output.shape[1] > x.shape[1]:
+                model_output = model_output[:, :x.shape[1]]
             score = model_output / -sigma_t
             return (-drift_mean + drift_var * score)
         
         def velocity_ode(x, t, model, **model_kwargs):
             model_output = model(x, t, **model_kwargs)
+            if model_output.shape[1] > x.shape[1]:
+                model_output = model_output[:, :x.shape[1]] # Extract u_theta
             return model_output
 
         if self.model_type == ModelType.NOISE:
@@ -203,7 +303,12 @@ class Transport:
         elif self.model_type == ModelType.SCORE:
             score_fn = lambda x, t, model, **kwagrs: model(x, t, **kwagrs)
         elif self.model_type == ModelType.VELOCITY:
-            score_fn = lambda x, t, model, **kwargs: self.path_sampler.get_score_from_velocity(model(x, t, **kwargs), x, t)
+            def _score_fn(x, t, model, **kwargs):
+                out = model(x, t, **kwargs)
+                if out.shape[1] > x.shape[1]:
+                    out = out[:, :x.shape[1]]
+                return self.path_sampler.get_score_from_velocity(out, x, t)
+            score_fn = _score_fn
         else:
             raise NotImplementedError()
         
@@ -379,6 +484,111 @@ class Sampler:
         )
         
         return _ode.sample
+    
+    def sample_jump_flow(
+        self,
+        *,
+        num_steps=50,
+        reverse=False,
+    ):
+        """returns a sampling function for mixed CTMC/SDE (Algorithm 2)
+        Args:
+        - num_steps: the actual number of integration steps performed
+        - reverse: whether solving in reverse; default to False
+        """
+        # Note: Jump logic is currently only valid for forward generation (t=0 to t=1)
+        import transport.path as path
+        import transport.transport as transport
+        
+        t0, t1 = self.transport.check_interval(
+            self.transport.train_eps,
+            self.transport.sample_eps,
+            sde=False,
+            eval=True,
+            reverse=reverse,
+            last_step_size=0.0,
+        )
+
+        t_list = th.linspace(t0, t1, num_steps)
+        dt = t_list[1] - t_list[0]
+
+        def _sample(init, model, **model_kwargs):
+            x = init
+            xs = [x]
+            has_module = hasattr(model, 'module')
+            base_model = model.module if has_module else model
+            num_bins = getattr(base_model, 'num_bins', 128)
+            jump_range = getattr(base_model, 'jump_range', 4.0)
+            in_channels = getattr(base_model, 'in_channels', x.shape[1])
+
+            for i, ti in tqdm(enumerate(t_list[:-1]), total=len(t_list)-1, desc="Jump Flow Euler"):
+                with th.no_grad():
+                    t_vec = th.ones(x.shape[0], device=x.device) * ti
+                    model_output = model(x, t_vec, **model_kwargs)
+                    
+                    if model_output.shape[1] > in_channels:
+                        v_theta = model_output[:, :in_channels]
+                        jump_head = model_output[:, in_channels:]
+                        
+                        jump_head_reshaped = jump_head.view(x.shape[0], in_channels, num_bins + 1, *x.shape[2:])
+                        dims = list(range(jump_head_reshaped.dim()))
+                        dims.append(dims.pop(2))
+                        jump_head_reshaped = jump_head_reshaped.permute(*dims)
+                        
+                        logits_b = jump_head_reshaped[..., :num_bins]
+                        intensity_logits = jump_head_reshaped[..., num_bins]
+                        
+                        lambda_t = th.nn.functional.softplus(intensity_logits)
+                        
+                        eps_val = 1e-5
+                        cur_t = ti.item()
+                        h = dt.item()
+                        
+                        if reverse:
+                            raise NotImplementedError("Reverse sampling for Jumps not fully supported.")
+                        
+                        if cur_t + h >= 1.0 - eps_val:
+                            # Avoid singularity exactly at t=1
+                            R = th.zeros_like(lambda_t)
+                        else:
+                            R_val = 0.5 * lambda_t * (1 - cur_t) * (1 - ((1 - cur_t)**2) / ((1 - cur_t - h)**2))
+                            R = th.exp(R_val)
+                        
+                        p_jump = th.clamp(1 - R, 0.0, 1.0)
+                        m = th.bernoulli(p_jump)
+                        
+                        J_theta = th.softmax(logits_b, dim=-1)
+                        y_bins = th.linspace(-jump_range, jump_range, num_bins, device=x.device)
+                        
+                        flat_J = J_theta.reshape(-1, num_bins)
+                        sampled_idx = th.multinomial(flat_J, 1).reshape(*J_theta.shape[:-1])
+                        jump_vals = y_bins[sampled_idx]
+                    else:
+                        m = 0
+                        jump_vals = 0
+                        v_theta = model_output
+
+                    if self.transport.model_type == transport.ModelType.NOISE:
+                        drift_mean, drift_var = self.transport.path_sampler.compute_drift(x, t_vec)
+                        sigma_t, _ = self.transport.path_sampler.compute_sigma_t(path.expand_t_like_x(t_vec, x))
+                        score = v_theta / -sigma_t
+                        c_drift = (-drift_mean + drift_var * score)
+                    elif self.transport.model_type == transport.ModelType.SCORE:
+                        drift_mean, drift_var = self.transport.path_sampler.compute_drift(x, t_vec)
+                        c_drift = (-drift_mean + drift_var * v_theta)
+                    else:
+                        c_drift = v_theta
+
+                    x_continuous = x + c_drift * dt
+                    
+                    if isinstance(m, int) and m == 0:
+                        x = x_continuous
+                    else:
+                        x = m * jump_vals + (1 - m) * x_continuous
+                        
+                    xs.append(x)
+            return xs
+        return _sample
 
     def sample_ode_likelihood(
         self,

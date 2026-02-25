@@ -128,6 +128,10 @@ class ICPlan:
         t = expand_t_like_x(t, x1)
         _, d_alpha_t = self.compute_alpha_t(t)
         _, d_sigma_t = self.compute_sigma_t(t)
+        # For linear path (ICPlan): d_alpha_t = 1, d_sigma_t = -1
+        # Returns: 1 * x1 + (-1) * x0 = z - epsilon
+        # Note: This is equivalent to u_t(x|z) = (z - x_t) / (1 - t) in paper F13,
+        # but numerically stable as it avoids division by (1 - t).
         return d_alpha_t * x1 + d_sigma_t * x0
     
     def plan(self, t, x0, x1):
