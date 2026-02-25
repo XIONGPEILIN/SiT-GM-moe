@@ -5,7 +5,6 @@ import torch.distributed as dist
 from PIL import Image
 import os
 import argparse
-import hashlib
 import math
 
 
@@ -19,11 +18,6 @@ def namespace_to_dict(namespace):
     }
 
 
-def generate_run_id(exp_name):
-    # https://stackoverflow.com/questions/16008670/how-to-hash-a-string-into-8-digits
-    return str(int(hashlib.sha256(exp_name.encode('utf-8')).hexdigest(), 16) % 10 ** 8)
-
-
 def initialize(args, entity, exp_name, project_name):
     config_dict = namespace_to_dict(args)
     wandb_key = os.environ.get("WANDB_KEY", None)
@@ -31,13 +25,19 @@ def initialize(args, entity, exp_name, project_name):
         wandb.login(key=wandb_key)
     else:
         wandb.login()  # uses cached credentials from `wandb login`
-    wandb.init(
-        project=project_name,
-        name=exp_name,
-        config=config_dict,
-        id=generate_run_id(exp_name),
-        resume="allow",
-    )
+    run_id = os.environ.get("WANDB_RUN_ID")
+    init_kwargs = {
+        "project": project_name,
+        "entity": entity,
+        "name": exp_name,
+        "config": config_dict,
+    }
+    # Default: let W&B generate a fresh run id to avoid collisions with deleted runs.
+    # Optional resume path: provide WANDB_RUN_ID explicitly.
+    if run_id:
+        init_kwargs["id"] = run_id
+        init_kwargs["resume"] = "allow"
+    wandb.init(**init_kwargs)
 
 
 def log(stats, step=None):
