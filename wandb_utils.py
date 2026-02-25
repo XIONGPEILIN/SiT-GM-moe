@@ -28,7 +28,6 @@ def initialize(args, entity, exp_name, project_name):
     run_id = os.environ.get("WANDB_RUN_ID")
     init_kwargs = {
         "project": project_name,
-        "entity": entity,
         "name": exp_name,
         "config": config_dict,
     }
