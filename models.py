@@ -268,11 +268,10 @@ class SiT(nn.Module):
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
 
-        # Apply CFG to jump head as well? For now, we mainly apply it to the flow part, 
-        # or apply to both:
-        cond_rest, uncond_rest = torch.split(rest, len(rest) // 2, dim=0)
-        half_rest = uncond_rest + cfg_scale * (cond_rest - uncond_rest)
-        rest = torch.cat([half_rest, half_rest], dim=0)
+        # Paper: "jump models do not have yet an equivalent of CFG"
+        # Use conditional jump head output directly (no CFG extrapolation)
+        cond_rest, _ = torch.split(rest, len(rest) // 2, dim=0)
+        rest = torch.cat([cond_rest, cond_rest], dim=0)
         
         return torch.cat([eps, rest], dim=1)
 

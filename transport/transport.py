@@ -1,6 +1,7 @@
 import torch as th
 import numpy as np
 import logging
+from tqdm import tqdm
 
 import enum
 
@@ -142,8 +143,8 @@ class Transport:
             terms = {}
             terms['pred'] = u_theta
             
-            # Flow loss should be summed spatially according to the paper (D = sum(D_0))
-            L_flow = ((u_theta - ut) ** 2).flatten(1).sum(dim=1).mean()
+            # Flow loss should be averaged spatially to match original SiT
+            L_flow = mean_flat((u_theta - ut) ** 2)
             
             # GM jump objective computation
             t_expand = path.expand_t_like_x(t, xt)
@@ -211,17 +212,15 @@ class Transport:
             # D = sum_{y} [ Q_theta(y;x) - Q(y;x) * log Q_theta(y;x) ]
             jump_loss_elementwise = Q_theta - Q_target * th.log(Q_theta + 1e-8)
             
-            # Mask out the bin that equals x (y != x exclusion)
-            xt_expanded = xt.unsqueeze(-1)
-            min_idx = th.argmin(th.abs(y_expanded - xt_expanded), dim=-1, keepdim=True)
-            is_y_not_x = th.ones_like(jump_loss_elementwise)
-            is_y_not_x.scatter_(-1, min_idx, 0.0)
+            # Mask out the bin that equals x (y != x exclusion) - masking a range of bins
+            xt_for_mask = xt.unsqueeze(-1)
+            is_y_not_x = (th.abs(y_expanded - xt_for_mask) > 0.5 * bin_width).float()
             jump_loss_elementwise = jump_loss_elementwise * is_y_not_x
             
             jump_loss_per_pixel = jump_loss_elementwise.sum(dim=-1)
             
-            # Spatial aggregation via Sum rather than mean_flat
-            L_jump = jump_loss_per_pixel.flatten(1).sum(dim=1).mean()
+            # Spatial aggregation via mean_flat rather than sum (keeps scale 1:1)
+            L_jump = mean_flat(jump_loss_per_pixel)
             
             terms['loss_flow'] = L_flow
             terms['loss_jump'] = L_jump
@@ -490,6 +489,7 @@ class Sampler:
         *,
         num_steps=50,
         reverse=False,
+        jump_alpha=0.5,
     ):
         """returns a sampling function for mixed CTMC/SDE (Algorithm 2)
         Args:
@@ -554,7 +554,7 @@ class Sampler:
                             R_val = 0.5 * lambda_t * (1 - cur_t) * (1 - ((1 - cur_t)**2) / ((1 - cur_t - h)**2))
                             R = th.exp(R_val)
                         
-                        p_jump = th.clamp(1 - R, 0.0, 1.0)
+                        p_jump = th.clamp(jump_alpha * (1 - R), 0.0, 1.0)
                         m = th.bernoulli(p_jump)
                         
                         J_theta = th.softmax(logits_b, dim=-1)

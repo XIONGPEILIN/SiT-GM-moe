@@ -149,11 +149,16 @@ def main(args):
     latent_size = args.image_size // 8
     model = SiT_models[args.model](
         input_size=latent_size,
-        num_classes=args.num_classes
-    )
+        num_classes=args.num_classes,
+        num_bins=getattr(args, 'num_bins', 128),
+        jump_range=getattr(args, 'jump_range', 4.0),
+    ).to(device)
 
     # Note that parameter initialization is done within the SiT constructor
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    ema = deepcopy(model)  # Create an EMA of the model for use after training
+
+    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
     if args.ckpt is not None:
         ckpt_path = args.ckpt
@@ -161,11 +166,18 @@ def main(args):
         model.load_state_dict(state_dict["model"])
         ema.load_state_dict(state_dict["ema"])
         opt.load_state_dict(state_dict["opt"])
+        old_args = args
         args = state_dict["args"]
+        if not hasattr(args, 'sampler_type'):
+            args.sampler_type = getattr(old_args, 'sampler_type', 'ode')
+        if not hasattr(args, 'num_bins'):
+            args.num_bins = getattr(old_args, 'num_bins', 128)
+        if not hasattr(args, 'jump_range'):
+            args.jump_range = getattr(old_args, 'jump_range', 4.0)
 
     requires_grad(ema, False)
     
-    model = DDP(model.to(device), device_ids=[device])
+    model = DDP(model, device_ids=[device])
     transport = create_transport(
         args.path_type,
         args.prediction,
@@ -176,9 +188,6 @@ def main(args):
     transport_sampler = Sampler(transport)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
     # Setup data:
     transform = transforms.Compose([
@@ -294,7 +303,10 @@ def main(args):
             if train_steps % args.sample_every == 0 and train_steps > 0:
                 logger.info("Generating EMA samples...")
                 with torch.no_grad():
-                    sample_fn = transport_sampler.sample_ode() # default to ode sampling
+                    if getattr(args, 'sampler_type', 'ode') == "jump_flow":
+                        sample_fn = transport_sampler.sample_jump_flow(num_steps=50)
+                    else:
+                        sample_fn = transport_sampler.sample_ode()
                     samples = sample_fn(zs, model_fn, **sample_model_kwargs)[-1]
                     dist.barrier()
 
@@ -335,6 +347,10 @@ if __name__ == "__main__":
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a custom SiT checkpoint")
+    parser.add_argument("--num-bins", type=int, default=128)
+    parser.add_argument("--jump-range", type=float, default=4.0)
+    parser.add_argument("--sampler-type", type=str, default="ode",
+                        choices=["ode", "jump_flow"])
 
     parse_transport_args(parser)
     args = parser.parse_args()

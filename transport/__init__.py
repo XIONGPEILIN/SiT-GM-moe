@@ -49,9 +49,9 @@ def create_transport(
         train_eps_new = 1e-3 if train_eps is None else train_eps
         sample_eps_new = 1e-3 if train_eps is None else sample_eps
         train_eps, sample_eps = train_eps_new, sample_eps_new
-    else: # velocity & [GVP, LINEAR] is stable everywhere
-        train_eps = 0
-        sample_eps = 0
+    else: # velocity & [GVP, LINEAR]
+        train_eps = 1e-5 if train_eps is None else train_eps
+        sample_eps = 1e-5 if sample_eps is None else sample_eps
     
     # create flow state
     state = Transport(
