@@ -20,7 +20,7 @@ def find_model(model_name):
         return download_model(model_name)
     else:  
         assert os.path.isfile(model_name), f'Could not find SiT checkpoint at {model_name}'
-        checkpoint = torch.load(model_name, map_location=lambda storage, loc: storage)
+        checkpoint = torch.load(model_name, map_location=lambda storage, loc: storage, weights_only=False)
         if "ema" in checkpoint:  # supports checkpoints from train.py
             checkpoint = checkpoint["ema"]
         return checkpoint
@@ -36,5 +36,5 @@ def download_model(model_name):
         os.makedirs('pretrained_models', exist_ok=True)
         web_path = f'https://www.dl.dropboxusercontent.com/scl/fi/as9oeomcbub47de5g4be0/SiT-XL-2-256.pt?rlkey=uxzxmpicu46coq3msb17b9ofa&dl=0'
         download_url(web_path, 'pretrained_models', filename=model_name)
-    model = torch.load(local_path, map_location=lambda storage, loc: storage)
+    model = torch.load(local_path, map_location=lambda storage, loc: storage, weights_only=False)
     return model

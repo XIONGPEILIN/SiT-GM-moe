@@ -13,7 +13,7 @@
 set -e
 
 CKPT_PATH="${1:?Error: CKPT_PATH is required. Usage: $0 <CKPT_PATH> [SAMPLE_DIR] [MODE]}"
-SAMPLE_DIR="${2:-samples_a100}"
+SAMPLE_DIR="${2:-samples_a6000}"
 MODE="${3:-MIXED}"
 
 # -------------------------------------------------------------------
@@ -22,12 +22,12 @@ MODE="${3:-MIXED}"
 # Batch:    128 per GPU (sampling has no grad, so can be very large)
 # Precision: FP32
 # -------------------------------------------------------------------
-
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 NUM_GPUS=8
-PER_PROC_BS=128
+PER_PROC_BS=32
 NUM_FID_SAMPLES=50000
 NUM_STEPS=250
-CFG_SCALE=4.0
+CFG_SCALE=1
 MODEL="SiT-XL/2"
 NUM_BINS=128
 JUMP_RANGE=3.0

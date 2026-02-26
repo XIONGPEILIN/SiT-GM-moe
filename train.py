@@ -9,7 +9,7 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
@@ -118,11 +118,11 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def create_logger(logging_dir):
+def create_logger(logging_dir, is_main_process):
     """
     Create a logger that writes to a log file and stdout.
     """
-    if dist.get_rank() == 0:  # real logger
+    if is_main_process:  # real logger
         logging.basicConfig(
             level=logging.INFO,
             format='[\033[34m%(asctime)s\033[0m] %(message)s',
@@ -167,19 +167,25 @@ def main(args):
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
+    # Initialize Accelerator:
+    accelerator = Accelerator(
+        mixed_precision=getattr(args, 'mixed_precision', 'no'),
+        log_with="wandb" if args.wandb else None
+    )
+    device = accelerator.device
+    
     # Setup DDP:
-    dist.init_process_group("nccl")
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank
+    rank = accelerator.process_index
+    seed = args.global_seed * accelerator.num_processes + rank
     torch.manual_seed(seed)
-    torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
-    local_batch_size = int(args.global_batch_size // dist.get_world_size())
+    print(f"Starting rank={rank}, seed={seed}, world_size={accelerator.num_processes}.")
+    local_batch_size = int(args.global_batch_size // accelerator.num_processes)
 
     # Setup an experiment folder:
-    if rank == 0:
+    experiment_dir = None
+    checkpoint_dir = None
+    
+    if accelerator.is_main_process:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         experiment_index = len(glob(f"{args.results_dir}/*"))
         model_string_name = args.model.replace("/", "-")  # e.g., SiT-XL/2 --> SiT-XL-2 (for naming folders)
@@ -188,7 +194,7 @@ def main(args):
         experiment_dir = f"{args.results_dir}/{experiment_name}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(experiment_dir)
+        logger = create_logger(experiment_dir, True)
         logger.info(f"Experiment directory created at {experiment_dir}")
 
         if args.wandb:
@@ -196,7 +202,20 @@ def main(args):
             project = os.environ.get("PROJECT", "SiT-GM-moe")
             wandb_utils.initialize(args, entity, experiment_name, project)
     else:
-        logger = create_logger(None)
+        logger = create_logger(None, False)
+    
+    # Broadcast experiment_dir and checkpoint_dir to all processes
+    # (Actually, we can just compute them on all processes if we handle the index carefully, 
+    # but broadcasting is safer. Alternatively, just compute 'experiment_name' on all.)
+    
+    # Simpler: All processes can compute the names, but only rank 0 creates the dir.
+    # To ensure index 000, 001 match, we should probably synchronize or let rank 0 decide.
+    
+    # Let's just gather the experiment_dir from rank 0:
+    experiment_dir_list = [experiment_dir]
+    dist.broadcast_object_list(experiment_dir_list, src=0)
+    experiment_dir = experiment_dir_list[0]
+    checkpoint_dir = f"{experiment_dir}/checkpoints"
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -214,24 +233,12 @@ def main(args):
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
-    if args.ckpt is not None:
-        ckpt_path = args.ckpt
-        state_dict = find_model(ckpt_path)
-        model.load_state_dict(state_dict["model"])
-        ema.load_state_dict(state_dict["ema"])
-        opt.load_state_dict(state_dict["opt"])
-        old_args = args
-        args = state_dict["args"]
-        if not hasattr(args, 'sampler_type'):
-            args.sampler_type = getattr(old_args, 'sampler_type', 'ode')
-        if not hasattr(args, 'num_bins'):
-            args.num_bins = getattr(old_args, 'num_bins', 128)
-        if not hasattr(args, 'jump_range'):
-            args.jump_range = getattr(old_args, 'jump_range', 4.0)
 
     requires_grad(ema, False)
     
-    model = DDP(model, device_ids=[device])
+    # We don't wrap EMA in Accelerator as it doesn't need optimization or distribution,
+    # but we do want it on the correct device.
+    ema = ema.to(device)
     transport = create_transport(
         args.path_type,
         args.prediction,
@@ -263,9 +270,12 @@ def main(args):
         dataset = CustomDataset(args.feature_path)
         if hasattr(logger, 'info'):
             logger.info(f"Dataset contains {len(dataset):,} features ({args.feature_path})")
+    
+    # Note: DistributedSampler is handled by Accelerator if we pass shuffle=True to DataLoader
+    # but since this code manually creates it, we'll keep it and let Accelerator handle the preparation.
     sampler = DistributedSampler(
         dataset,
-        num_replicas=dist.get_world_size(),
+        num_replicas=accelerator.num_processes,
         rank=rank,
         shuffle=True,
         seed=args.global_seed
@@ -304,13 +314,17 @@ def main(args):
             drop_last=True
         )
 
+    # Prepare everything with Accelerator:
+    model, opt, loader = accelerator.prepare(model, opt, loader)
+
     # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    update_ema(ema, accelerator.unwrap_model(model), decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
     # Variables for monitoring/logging purposes:
     train_steps = 0
+    start_epoch = 0
     log_steps = 0
     running_loss = 0
     running_loss_flow = 0
@@ -336,12 +350,62 @@ def main(args):
         model_fn = ema.forward
 
     logger.info(f"Training for {args.epochs} epochs...")
-    for epoch in range(args.epochs):
+    
+    # Resume or Initialize from checkpoint:
+    if args.ckpt is not None:
+        if os.path.isdir(args.ckpt):
+            logger.info(f"Resuming from accelerate state folder: {args.ckpt}")
+            accelerator.load_state(args.ckpt)
+            
+            # Load EMA separately (custom tracking)
+            ema_path = os.path.join(args.ckpt, "ema.pt")
+            if os.path.exists(ema_path):
+                logger.info(f"Loading EMA from {ema_path}")
+                ema.load_state_dict(torch.load(ema_path, map_location=device))
+            else:
+                logger.warning("EMA checkpoint not found in state directory.")
+            
+            # Restore training progress metadata
+            state_info_path = os.path.join(args.ckpt, "training_state.json")
+            if os.path.exists(state_info_path):
+                with open(state_info_path, "r") as f:
+                    state_info = json.load(f)
+                    train_steps = state_info.get("train_steps", 0)
+                    start_epoch = state_info.get("epoch", 0)
+                    logger.info(f"Restored train_steps={train_steps}, epoch={start_epoch}")
+            else:
+                try:
+                    train_steps = int(os.path.basename(args.ckpt))
+                    logger.info(f"Extracted train_steps={train_steps} from directory name.")
+                except:
+                    pass
+        elif os.path.isfile(args.ckpt):
+            logger.info(f"Initializing from checkpoint file: {args.ckpt}")
+            checkpoint = torch.load(args.ckpt, map_location=device)
+            # Handle different checkpoint formats
+            if "model" in checkpoint:
+                accelerator.unwrap_model(model).load_state_dict(checkpoint["model"])
+                if "ema" in checkpoint:
+                    ema.load_state_dict(checkpoint["ema"])
+                if "opt" in checkpoint:
+                    opt.load_state_dict(checkpoint["opt"])
+                # Extract steps from filename if possible
+                try:
+                    train_steps = int(os.path.basename(args.ckpt).split('.')[0])
+                except:
+                    pass
+            else:
+                # Direct weight loading (e.g. pretrained model)
+                accelerator.unwrap_model(model).load_state_dict(checkpoint)
+                update_ema(ema, accelerator.unwrap_model(model), decay=0)
+        else:
+            logger.error(f"Checkpoint path not found: {args.ckpt}")
+
+    for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
+            # Accelerator handles device placement
             if args.feature_path is None:
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
@@ -355,9 +419,9 @@ def main(args):
             loss_dict = transport.training_losses(model, x, model_kwargs)
             loss = loss_dict["loss"].mean()
             opt.zero_grad()
-            loss.backward()
+            accelerator.backward(loss)
             opt.step()
-            update_ema(ema, model.module)
+            update_ema(ema, accelerator.unwrap_model(model))
 
             # Log loss values:
             running_loss += loss.item()
@@ -372,18 +436,14 @@ def main(args):
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                # Reduce loss history over all processes:
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                avg_loss_flow = torch.tensor(running_loss_flow / log_steps, device=device)
-                avg_loss_jump = torch.tensor(running_loss_jump / log_steps, device=device)
                 
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                dist.all_reduce(avg_loss_flow, op=dist.ReduceOp.SUM)
-                dist.all_reduce(avg_loss_jump, op=dist.ReduceOp.SUM)
+                # Collective average across all GPUs (mathematically same as original all_reduce)
+                log_stats = torch.tensor([running_loss, running_loss_flow, running_loss_jump], device=device)
+                dist.all_reduce(log_stats, op=dist.ReduceOp.SUM)
+                log_stats = log_stats / (accelerator.num_processes * log_steps)
                 
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                avg_loss_flow = avg_loss_flow.item() / dist.get_world_size()
-                avg_loss_jump = avg_loss_jump.item() / dist.get_world_size()
+                avg_loss, avg_loss_flow, avg_loss_jump = log_stats.tolist()
+
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f} (Flow: {avg_loss_flow:.4f}, Jump: {avg_loss_jump:.4f}), Train Steps/Sec: {steps_per_sec:.2f}")
                 if args.wandb:
                     wandb_utils.log(
@@ -404,17 +464,28 @@ def main(args):
 
             # Save SiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                if rank == 0:
-                    checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "args": args
-                    }
-                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
-                dist.barrier()
+                checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}"
+                accelerator.save_state(checkpoint_path)
+                
+                if accelerator.is_main_process:
+                    # 1. Save EMA separately (for accelerate resume)
+                    ema_path = f"{checkpoint_path}/ema.pt"
+                    torch.save(ema.state_dict(), ema_path)
+                    
+                    # 2. Save training metadata
+                    state_info = {"train_steps": train_steps, "epoch": epoch}
+                    with open(f"{checkpoint_path}/training_state.json", "w") as f:
+                        json.dump(state_info, f)
+                        
+                    # 3. CRITICAL: Save a standalone .pt file for direct inference (compatible with sample.py)
+                    # This contains only the EMA weights, which is what find_model/sample.py expects
+                    inference_ckpt_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                    torch.save(ema.state_dict(), inference_ckpt_path)
+                    
+                    logger.info(f"Saved accelerator state to {checkpoint_path}")
+                    logger.info(f"Saved inference-ready model to {inference_ckpt_path}")
+                
+                accelerator.wait_for_everyone()
             
             if train_steps % args.sample_every == 0 and train_steps > 0:
                 logger.info("Generating EMA samples...")
@@ -424,7 +495,7 @@ def main(args):
                     else:
                         sample_fn = transport_sampler.sample_ode()
                     samples = sample_fn(zs, model_fn, **sample_model_kwargs)[-1]
-                    dist.barrier()
+                    accelerator.wait_for_everyone()
 
                     if use_cfg: #remove null samples
                         samples, _ = samples.chunk(2, dim=0)
@@ -439,8 +510,7 @@ def main(args):
                             decoded_samples.append(decoded_chunk)
                         samples = torch.cat(decoded_samples, dim=0)
 
-                        out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
-                        dist.all_gather_into_tensor(out_samples, samples)
+                        out_samples = accelerator.gather(samples)
                     else:
                         out_samples = None
 

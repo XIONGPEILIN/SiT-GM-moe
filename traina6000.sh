@@ -25,7 +25,7 @@ CKPT_PATH="${3:-}"
 # -------------------------------------------------------------------
 
 NUM_GPUS=8
-GLOBAL_BATCH=256  # 128 per GPU
+GLOBAL_BATCH=256  # 32 per GPU
 MODEL="SiT-XL/2"
 NUM_BINS=128
 JUMP_RANGE=3.0
