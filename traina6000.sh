@@ -75,9 +75,7 @@ echo " Global BS: $GLOBAL_BATCH  (${NUM_GPUS} GPUs × $((GLOBAL_BATCH / NUM_GPUS
 echo " NCCL: ALGO=$NCCL_ALGO P2P_LEVEL=$NCCL_P2P_LEVEL BUFFSIZE=$NCCL_BUFFSIZE"
 echo "=========================================="
 
-accelerate launch \
-    --num_processes $NUM_GPUS \
-    --mixed_precision no \
+torchrun --nnodes=1 --nproc_per_node=$NUM_GPUS \
     train.py \
     --model "$MODEL" \
     --feature-path "$FEATURE_PATH" \
@@ -95,3 +93,4 @@ accelerate launch \
     --cfg-scale 4.0 \
     --wandb \
     $CKPT_ARG
+
