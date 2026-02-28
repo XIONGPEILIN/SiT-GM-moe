@@ -17,7 +17,7 @@ from torchvision import transforms
 import numpy as np
 from collections import OrderedDict
 from PIL import Image
-from copy import deepcopy
+from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
 from glob import glob
 from time import time
 import argparse
@@ -89,6 +89,15 @@ class CustomDataset(Dataset):
         features = np.load(os.path.join(self.features_dir, feature_file))
         labels = np.load(os.path.join(self.labels_dir, label_file))
         return torch.from_numpy(features), torch.from_numpy(labels)
+
+class RepeatedDataset(Dataset):
+    def __init__(self, dataset, n):
+        self.dataset = dataset
+        self.n = n
+    def __len__(self):
+        return len(self.dataset) * self.n
+    def __getitem__(self, idx):
+        return self.dataset[idx % len(self.dataset)]
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -176,7 +185,7 @@ def main(args):
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
-    local_batch_size = int(args.global_batch_size // dist.get_world_size())
+    local_batch_size = max(1, int(args.global_batch_size // dist.get_world_size()))
 
     # Setup an experiment folder:
     if rank == 0:
@@ -208,18 +217,36 @@ def main(args):
         jump_range=getattr(args, 'jump_range', 4.0),
     ).to(device)
 
-    # Note that parameter initialization is done within the SiT constructor
-    ema = deepcopy(model)  # Create an EMA of the model for use after training
+    # Freeze unused heads based on sampler-type:
+    if args.sampler_type == "ode":
+        print("Training ODE ONLY: freezing jump head.")
+        requires_grad(model.final_layer_jump, False)
+    elif args.sampler_type == "jump":
+        print("Training JUMP ONLY: freezing flow head.")
+        requires_grad(model.final_layer_flow, False)
+    elif args.sampler_type == "jump_flow":
+        print("Training BOTH flow and jump heads.")
 
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    # Note that parameter initialization is done within the SiT constructor
+    # No EMA needed: Schedule-Free handles internal weight averaging
+
+    # Setup optimizer: ProdigyPlusScheduleFree (auto-tunes LR, no scheduler needed)
+    opt = ProdigyPlusScheduleFree(
+        model.parameters(), lr=1.0, betas=(0.95, 0.99),
+        weight_decay=0.0, d0=1e-6, d_coef=1.0,
+        use_stableadamw=True, use_schedulefree=True,
+        split_groups=True, factored=True,
+    )
 
     if args.ckpt is not None:
         ckpt_path = args.ckpt
         state_dict = find_model(ckpt_path)
         model.load_state_dict(state_dict["model"])
-        ema.load_state_dict(state_dict["ema"])
-        opt.load_state_dict(state_dict["opt"])
+        if "opt" in state_dict:
+            try:
+                opt.load_state_dict(state_dict["opt"])
+            except Exception as e:
+                print(f"Warning: Could not load optimizer state: {e}. Starting with fresh optimizer.")
         old_args = args
         args = state_dict["args"]
         if not hasattr(args, 'sampler_type'):
@@ -228,8 +255,6 @@ def main(args):
             args.num_bins = getattr(old_args, 'num_bins', 128)
         if not hasattr(args, 'jump_range'):
             args.jump_range = getattr(old_args, 'jump_range', 4.0)
-
-    requires_grad(ema, False)
     
     model = DDP(model, device_ids=[device])
     transport = create_transport(
@@ -263,6 +288,28 @@ def main(args):
         dataset = CustomDataset(args.feature_path)
         if hasattr(logger, 'info'):
             logger.info(f"Dataset contains {len(dataset):,} features ({args.feature_path})")
+
+    # Limit dataset size if requested:
+    if args.max_train_samples is not None:
+        if args.feature_path is None:
+            num_samples = min(len(dataset), args.max_train_samples)
+        else:
+            # Each item in CustomDataset is 32 images (pre-batched files)
+            num_samples = min(len(dataset), max(1, args.max_train_samples // 32))
+        
+        # Use Subset for raw images, but for CustomDataset we can just slice files if we want,
+        # however Subset is more generic for the sampler.
+        from torch.utils.data import Subset
+        indices = list(range(num_samples))
+        dataset = Subset(dataset, indices)
+        if hasattr(logger, 'info'):
+            logger.info(f"Limited dataset to {num_samples} items (~{args.max_train_samples} samples)")
+
+    # Repeat dataset if requested:
+    if getattr(args, 'dataset_repeat', 1) > 1:
+        dataset = RepeatedDataset(dataset, args.dataset_repeat)
+        if hasattr(logger, 'info'):
+            logger.info(f"Repeated dataset {args.dataset_repeat} times. Total items: {len(dataset):,}")
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -287,6 +334,10 @@ def main(args):
             # batch is a list of tuples: [(features_b1, labels_b1), (features_b2, labels_b2), ...]
             features = torch.cat([b[0] for b in batch], dim=0)
             labels = torch.cat([b[1] for b in batch], dim=0)
+            # If the cat-ed files have more samples than local_batch_size (e.g. 32 > 1), slice it.
+            if features.shape[0] > local_batch_size:
+                features = features[:local_batch_size]
+                labels = labels[:local_batch_size]
             return features, labels
             
         # Calculate how many pre-batched "files" to load per step to reach local_batch_size
@@ -305,9 +356,8 @@ def main(args):
         )
 
     # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
-    ema.eval()  # EMA model should always be in eval mode
+    opt.train()  # Schedule-Free: switch to training mode
 
     # Variables for monitoring/logging purposes:
     train_steps = 0
@@ -330,10 +380,10 @@ def main(args):
         y_null = torch.tensor([1000] * n, device=device)
         ys = torch.cat([ys, y_null], 0)
         sample_model_kwargs = dict(y=ys, cfg_scale=args.cfg_scale)
-        model_fn = ema.forward_with_cfg
+        model_fn = model.module.forward_with_cfg
     else:
         sample_model_kwargs = dict(y=ys)
-        model_fn = ema.forward
+        model_fn = model.module.forward
 
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(args.epochs):
@@ -353,11 +403,17 @@ def main(args):
                 pass
             model_kwargs = dict(y=y)
             loss_dict = transport.training_losses(model, x, model_kwargs)
-            loss = loss_dict["loss"].mean()
+            sampler_type = getattr(args, 'sampler_type', 'ode')
+            if sampler_type == "ode":
+                loss = loss_dict["loss_flow"].mean()
+            elif sampler_type == "jump":
+                loss = loss_dict["loss_jump"].mean()
+            else:  # "jump_flow"
+                loss = loss_dict["loss"].mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
-            update_ema(ema, model.module)
+            # No EMA update needed: Schedule-Free handles averaging internally
 
             # Log loss values:
             running_loss += loss.item()
@@ -384,14 +440,22 @@ def main(args):
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 avg_loss_flow = avg_loss_flow.item() / dist.get_world_size()
                 avg_loss_jump = avg_loss_jump.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f} (Flow: {avg_loss_flow:.4f}, Jump: {avg_loss_jump:.4f}), Train Steps/Sec: {steps_per_sec:.2f}")
+                
+                # Fetch Prodigy Schedule-Free dynamic learning rate correctly
+                group = opt.param_groups[0]
+                d_val = group.get('d', 1.0)
+                effective_lr = group.get('effective_lr', group.get('lr', 1.0))
+                current_lr = d_val * effective_lr
+                
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f} (Flow: {avg_loss_flow:.4f}, Jump: {avg_loss_jump:.4f}), Train Steps/Sec: {steps_per_sec:.2f}, LR: {current_lr:.6e}")
                 if args.wandb:
                     wandb_utils.log(
                         { 
                             "train loss": avg_loss, 
                             "train loss flow": avg_loss_flow,
                             "train loss jump": avg_loss_jump,
-                            "train steps/sec": steps_per_sec 
+                            "train steps/sec": steps_per_sec,
+                            "lr": current_lr
                         },
                         step=train_steps
                     )
@@ -404,10 +468,13 @@ def main(args):
 
             # Save SiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
+                # Schedule-Free: must call opt.eval() before saving model weights
+                # so that model.state_dict() reflects the averaged weights (not training buffer)
+                opt.eval()
+                model.eval()
                 if rank == 0:
                     checkpoint = {
                         "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "args": args
                     }
@@ -415,13 +482,18 @@ def main(args):
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
+                model.train()
+                opt.train()  # Schedule-Free: switch back to training mode
             
             if train_steps % args.sample_every == 0 and train_steps > 0:
-                logger.info("Generating EMA samples...")
+                logger.info("Generating samples...")
+                opt.eval()  # Schedule-Free: switch to eval mode for sampling
+                model.eval()
                 with torch.no_grad():
-                    if getattr(args, 'sampler_type', 'ode') == "jump_flow":
+                    sampler_type = getattr(args, 'sampler_type', 'ode')
+                    if sampler_type in ["jump_flow", "jump"]:
                         sample_fn = transport_sampler.sample_jump_flow(num_steps=50)
-                    else:
+                    else:  # "ode"
                         sample_fn = transport_sampler.sample_ode()
                     samples = sample_fn(zs, model_fn, **sample_model_kwargs)[-1]
                     dist.barrier()
@@ -446,10 +518,13 @@ def main(args):
 
                 if args.wandb and out_samples is not None:
                     wandb_utils.log_image(out_samples, train_steps)
-                logging.info("Generating EMA samples done.")
+                model.train()
+                opt.train()  # Schedule-Free: switch back to training mode
+                logging.info("Generating samples done.")
 
     model.eval()  # important! This disables randomized embedding dropout
-    # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
+    opt.eval()  # Schedule-Free: switch to eval mode
+    # do any sampling/FID calculation/etc. with model in eval mode ...
 
     logger.info("Done!")
     cleanup()
@@ -474,12 +549,16 @@ if __name__ == "__main__":
     parser.add_argument("--sample-every", type=int, default=10_000)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--max-train-samples", type=int, default=None,
+                        help="Limit the number of training samples (e.g. 512)")
+    parser.add_argument("--dataset-repeat", type=int, default=1,
+                        help="Repeat the dataset N times for longer epochs")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a custom SiT checkpoint")
     parser.add_argument("--num-bins", type=int, default=128)
     parser.add_argument("--jump-range", type=float, default=3.0)
     parser.add_argument("--sampler-type", type=str, default="ode",
-                        choices=["ode", "jump_flow"])
+                        choices=["ode", "jump_flow", "jump"])
 
     parse_transport_args(parser)
     args = parser.parse_args()

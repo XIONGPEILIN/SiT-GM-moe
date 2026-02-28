@@ -1,13 +1,14 @@
-import torch as th
-import numpy as np
+import enum
 import logging
+
+import numpy as np
+import torch as th
 from tqdm import tqdm
 
-import enum
-
 from . import path
-from .utils import EasyDict, log_state, mean_flat, sum_flat
 from .integrators import ode, sde
+from .utils import EasyDict, log_state, mean_flat, sum_flat
+
 
 class ModelType(enum.Enum):
     """
@@ -145,15 +146,15 @@ class Transport:
             terms = {}
             terms['pred'] = u_theta
             
-            # Flow loss uses mean_flat (MSE) per paper (main.tex:2798)
+            # Flow loss uses mean per user request
             diff = u_theta - ut
             breg_type = getattr(self, 'bregman_type', 'mse')
             if breg_type == 'cosh':
-                L_flow = mean_flat(th.cosh(diff) - 1).mean()
+                L_flow = (th.cosh(diff) - 1).mean()
             elif breg_type == 'exp':
-                L_flow = mean_flat(th.exp(diff) - diff - 1).mean()
+                L_flow = (th.exp(diff) - diff - 1).mean()
             else:
-                L_flow = mean_flat(diff ** 2).mean()
+                L_flow = (diff ** 2).mean()
             
             # GM jump objective computation
             t_expand = path.expand_t_like_x(t, xt)
@@ -228,24 +229,14 @@ class Transport:
             # D = sum_{y} [ Q_theta(y;x) - Q(y;x) * log Q_theta(y;x) ]
             jump_loss_elementwise = Q_theta - Q_target * th.log(Q_theta + 1e-8)
             
-            # Mask out the bin that equals x (y != x exclusion) - masking exactly the closest bin
-            xt_expanded = xt.unsqueeze(-1)
-            min_idx = th.argmin(th.abs(y_expanded - xt_expanded), dim=-1, keepdim=True)
-            is_y_not_x = th.ones_like(jump_loss_elementwise)
-            is_y_not_x.scatter_(-1, min_idx, 0.0)
-            jump_loss_elementwise = jump_loss_elementwise * is_y_not_x
-            
             jump_loss_per_pixel = jump_loss_elementwise.sum(dim=-1)
             
-            # Spatial aggregation via mean_flat to consistently scale with L_flow
-            L_jump_raw = mean_flat(jump_loss_per_pixel).mean()
-            
-            # Scale jump loss down by 0.2 for gradients
-            L_jump_scaled = L_jump_raw * 0.2
+            # Spatial aggregation via mean per user request
+            L_jump_raw = jump_loss_per_pixel.mean()
             
             terms['loss_flow'] = L_flow
             terms['loss_jump'] = L_jump_raw  # Keep original value for wandb logging
-            terms['loss'] = L_flow + L_jump_scaled
+            terms['loss'] = L_flow + L_jump_raw
             
         else:
             B, *_, C = xt.shape
@@ -265,9 +256,9 @@ class Transport:
                 raise NotImplementedError()
             
             if self.model_type == ModelType.NOISE:
-                terms['loss'] = mean_flat(weight * ((model_output - x0) ** 2)).mean()
+                terms['loss'] = (weight * ((model_output - x0) ** 2)).flatten(1).sum(1).mean()
             else:
-                terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2)).mean()
+                terms['loss'] = (weight * ((model_output * sigma_t + x0) ** 2)).flatten(1).sum(1).mean()
                 
         return terms
     
@@ -591,15 +582,25 @@ class Sampler:
                             R_val = 0.5 * lambda_t_weighted * (1 - cur_t) * (1 - ((1 - cur_t)**2) / ((1 - cur_t - h)**2))
                             R = th.exp(R_val)
 
-                        p_jump = th.clamp(1 - R, 0.0, 1.0)
-                        m = th.bernoulli(p_jump)
+                        # --- Probability Flow ODE (PF-ODE) for Jump Generator ---
+                        # Instead of discrete multinomial leaps (which break the continuous VAE latent space and cause colorful noise),
+                        # we construct the equivalent Continuous Velocity Field based on the Kramers-Moyal expansion first-order term.
                         
+                        # 1. Expected target position (Center of gravity of the Jump logits)
                         J_theta = th.softmax(logits_b, dim=-1)
                         y_bins = th.linspace(-jump_range, jump_range, num_bins, device=x.device)
+                        expected_y = (J_theta * y_bins).sum(dim=-1)
                         
-                        flat_J = J_theta.reshape(-1, num_bins)
-                        sampled_idx = th.multinomial(flat_J, 1).reshape(*J_theta.shape[:-1])
-                        jump_vals = y_bins[sampled_idx]
+                        # 2. Convert to Velocity Field: v_jump = lambda(x) * (E[y] - x)
+                        # We approximate lambda(x) dt with p_jump (the integration of lambda over the timestep dt)
+                        # So the step displacement is roughly: dx_jump = p_jump * (E[y] - x)
+                        # Which we can write simply as a displacement offset to be applied.
+                        p_jump = th.clamp(1 - R, 0.0, 1.0)
+                        
+                        # We assign this effective continuous displacement back to m and jump_vals
+                        # so that x = x + m * (jump_vals - x) exactly yields our PF-ODE integration step.
+                        jump_vals = expected_y
+                        m = p_jump
                     else:
                         m = 0
                         jump_vals = 0

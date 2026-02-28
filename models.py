@@ -163,10 +163,9 @@ class SiT(nn.Module):
         self.in_channels = in_channels
         self.num_bins = num_bins
         self.jump_range = jump_range
-        # out_channels = flow_channels + jump_channels
-        # flow_channels = in_channels
-        # jump_channels = in_channels * (num_bins + 1)
-        self.out_channels = in_channels + in_channels * (num_bins + 1)
+        self.flow_channels = in_channels
+        self.jump_channels = in_channels * (num_bins + 1)
+        self.out_channels = self.flow_channels + self.jump_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
 
@@ -180,7 +179,8 @@ class SiT(nn.Module):
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.final_layer_flow = FinalLayer(hidden_size, patch_size, self.flow_channels)
+        self.final_layer_jump = FinalLayer(hidden_size, patch_size, self.jump_channels)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -214,17 +214,22 @@ class SiT(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        nn.init.constant_(self.final_layer_flow.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer_flow.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer_flow.linear.weight, 0)
+        nn.init.constant_(self.final_layer_flow.linear.bias, 0)
+        
+        nn.init.constant_(self.final_layer_jump.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer_jump.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer_jump.linear.weight, 0)
+        nn.init.constant_(self.final_layer_jump.linear.bias, 0)
 
-    def unpatchify(self, x):
+    def unpatchify(self, x, out_channels=None):
         """
         x: (N, T, patch_size**2 * C)
         imgs: (N, H, W, C)
         """
-        c = self.out_channels
+        c = self.out_channels if out_channels is None else out_channels
         p = self.x_embedder.patch_size[0]
         h = w = int(x.shape[1] ** 0.5)
         assert h * w == x.shape[1]
@@ -247,8 +252,14 @@ class SiT(nn.Module):
         c = t + y                                # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
-        x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)                   # (N, out_channels, H, W)
+            
+        x_flow = self.final_layer_flow(x, c)      # (N, T, patch_size ** 2 * flow_channels)
+        x_jump = self.final_layer_jump(x, c)      # (N, T, patch_size ** 2 * jump_channels)
+        
+        x_flow = self.unpatchify(x_flow, out_channels=self.flow_channels) # (N, flow_channels, H, W)
+        x_jump = self.unpatchify(x_jump, out_channels=self.jump_channels) # (N, jump_channels, H, W)
+        
+        x = torch.cat([x_flow, x_jump], dim=1)    # (N, out_channels, H, W)
         # We don't chunk here because transport loss should handle the splitting of out_channels
         return x
 
@@ -260,36 +271,32 @@ class SiT(nn.Module):
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
         model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # For jump head CFG, we handle it analogously if needed, but standard CFG applied to all channels:
         eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
 
-        # Paper: "jump models do not have yet an equivalent of CFG"
-        # However, physically we can decouple: apply CFG to J_t (where to jump), 
-        # but NOT to lambda_t (jump intensity).
+        # Apply CFG to Jump Logits (J) but NOT to Jump Intensity (lambda)
         cond_rest, uncond_rest = torch.split(rest, len(rest) // 2, dim=0)
-        B_orig, C_out_jump, H, W = cond_rest.shape
+        B_orig, _, H, W = cond_rest.shape
         C_in = self.in_channels
         bins = self.num_bins
         
-        cond_rest_reshaped = cond_rest.view(B_orig, C_in, bins + 1, H, W)
-        uncond_rest_reshaped = uncond_rest.view(B_orig, C_in, bins + 1, H, W)
+        # Reshape to (B, C, bins+1, H, W) to separate logits from intensity
+        cond_rest_r = cond_rest.view(B_orig, C_in, bins + 1, H, W)
+        uncond_rest_r = uncond_rest.view(B_orig, C_in, bins + 1, H, W)
         
-        # J_t (logits): apply CFG
-        cond_J = cond_rest_reshaped[:, :, :bins]
-        uncond_J = uncond_rest_reshaped[:, :, :bins]
-        CFG_J = uncond_J + cfg_scale * (cond_J - uncond_J)
+        # Extract Logits and apply CFG
+        cond_J = cond_rest_r[:, :, :bins]
+        uncond_J = uncond_rest_r[:, :, :bins]
+        half_J = uncond_J + cfg_scale * (cond_J - uncond_J)
         
-        # lambda_t (intensity factor): NO CFG, use conditional
-        CFG_lambda = cond_rest_reshaped[:, :, bins:]
+        # Keep intensity unguided (use conditional prediction)
+        half_lambda = cond_rest_r[:, :, bins:]
         
-        half_rest = torch.cat([CFG_J, CFG_lambda], dim=2).view(B_orig, C_out_jump, H, W)
+        # Reconstruct and return
+        half_rest = torch.cat([half_J, half_lambda], dim=2).view(B_orig, -1, H, W)
         rest = torch.cat([half_rest, half_rest], dim=0)
-        
         return torch.cat([eps, rest], dim=1)
 
 
