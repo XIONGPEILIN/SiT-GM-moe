@@ -46,7 +46,8 @@ def main(mode, args):
     Run sampling.
     """
     torch.backends.cuda.matmul.allow_tf32 = args.tf32  # True: fast but may lead to some small numerical differences
-    assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
+    assert torch.cuda.is_available(
+    ), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
     torch.set_grad_enabled(False)
 
     # Setup DDP:
@@ -56,13 +57,15 @@ def main(mode, args):
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    print(
+        f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
     if args.ckpt is None:
         assert args.model == "SiT-XL/2", "Only SiT-XL/2 models are available for auto-download."
         assert args.image_size in [256, 512]
         assert args.num_classes == 1000
-        assert args.image_size == 256, "512x512 models are not yet available for auto-download." # remove this line when 512x512 models are available
+        # remove this line when 512x512 models are available
+        assert args.image_size == 256, "512x512 models are not yet available for auto-download."
         learn_sigma = args.image_size == 256
     else:
         learn_sigma = False
@@ -81,14 +84,15 @@ def main(mode, args):
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict)
     model.eval()  # important!
-    
-    
+
     transport = create_transport(
         args.path_type,
         args.prediction,
         args.loss_weight,
         args.train_eps,
-        args.sample_eps
+        args.sample_eps,
+        bregman_type=args.bregman_type,
+        time_schedule=args.time_schedule,
     )
     sampler = Sampler(transport)
     if mode == "ODE":
@@ -122,26 +126,34 @@ def main(mode, args):
             num_steps=args.num_sampling_steps,
             reverse=args.reverse
         )
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    elif mode == "JUMP":
+        sample_fn = sampler.sample_jump_flow(
+            num_steps=args.num_sampling_steps,
+            reverse=args.reverse,
+            pure_jump=True
+        )
+    vae = AutoencoderKL.from_pretrained(
+        f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
     using_cfg = args.cfg_scale > 1.0
 
     # Create folder to save samples:
     model_string_name = args.model.replace("/", "-")
-    ckpt_string_name = os.path.basename(args.ckpt).replace(".pt", "") if args.ckpt else "pretrained"
+    ckpt_string_name = os.path.basename(args.ckpt).replace(
+        ".pt", "") if args.ckpt else "pretrained"
     if mode == "ODE":
         folder_name = f"{model_string_name}-{ckpt_string_name}-" \
-                  f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
-                  f"{mode}-{args.num_sampling_steps}-{args.sampling_method}"
+            f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
+            f"{mode}-{args.num_sampling_steps}-{args.sampling_method}"
     elif mode == "SDE":
         folder_name = f"{model_string_name}-{ckpt_string_name}-" \
-                    f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
-                    f"{mode}-{args.num_sampling_steps}-{args.sampling_method}-"\
-                    f"{args.diffusion_form}-{args.last_step}-{args.last_step_size}"
-    elif mode == "MIXED":
+            f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
+            f"{mode}-{args.num_sampling_steps}-{args.sampling_method}-"\
+            f"{args.diffusion_form}-{args.last_step}-{args.last_step_size}"
+    elif mode in ["MIXED", "JUMP"]:
         folder_name = f"{model_string_name}-{ckpt_string_name}-" \
-                    f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
-                    f"{mode}-{args.num_sampling_steps}"
+            f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
+            f"{mode}-{args.num_sampling_steps}"
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
     if rank == 0:
         os.makedirs(sample_folder_dir, exist_ok=True)
@@ -152,24 +164,61 @@ def main(mode, args):
     n = args.per_proc_batch_size
     global_batch_size = n * dist.get_world_size()
     # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
-    num_samples = len([name for name in os.listdir(sample_folder_dir) if (os.path.isfile(os.path.join(sample_folder_dir, name)) and ".png" in name)])
-    total_samples = int(math.ceil(args.num_fid_samples / global_batch_size) * global_batch_size)
+    num_samples = len([name for name in os.listdir(sample_folder_dir) if (
+        os.path.isfile(os.path.join(sample_folder_dir, name)) and ".png" in name)])
+    total_samples = int(math.ceil(args.num_fid_samples /
+                        global_batch_size) * global_batch_size)
     if rank == 0:
         print(f"Total number of images that will be sampled: {total_samples}")
-    assert total_samples % dist.get_world_size() == 0, "total_samples must be divisible by world_size"
+    assert total_samples % dist.get_world_size(
+    ) == 0, "total_samples must be divisible by world_size"
     samples_needed_this_gpu = int(total_samples // dist.get_world_size())
     assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
     iterations = int(samples_needed_this_gpu // n)
-    done_iterations = int( int(num_samples // dist.get_world_size()) // n)
-    pbar = range(iterations)
+    done_iterations = int(int(num_samples // dist.get_world_size()) // n)
+    done_iterations = min(done_iterations, iterations)
+    if rank == 0 and done_iterations > 0:
+        print(
+            f"Resuming sampling: {done_iterations}/{iterations} iterations already complete.")
+    pbar = range(done_iterations, iterations)
     pbar = tqdm(pbar) if rank == 0 else pbar
-    total = 0
-    
+    total = done_iterations * global_batch_size
+
     for i in pbar:
         # Sample inputs:
-        z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
-        y = torch.randint(0, args.num_classes, (n,), device=device)
-        
+        if getattr(args, 'test_trained_only', False):
+            # Load exactly the first 64 features and labels
+            features_dir_y = "/home/yanai-lab/xiong-p/SiT-GM-moe/imagenet_feature/imagenet256_labels"
+            y_0 = np.load(f"{features_dir_y}/0_0.npy")
+            y_1 = np.load(f"{features_dir_y}/0_1.npy")
+            all_y = torch.tensor(np.concatenate(
+                [y_0, y_1]), device=device).long()
+
+            features_dir_z = "/home/yanai-lab/xiong-p/SiT-GM-moe/imagenet_feature/imagenet256_features"
+            z_0 = np.load(f"{features_dir_z}/0_0.npy")
+            z_1 = np.load(f"{features_dir_z}/0_1.npy")
+            all_z = torch.tensor(np.concatenate(
+                [z_0, z_1]), device=device, dtype=torch.float32)
+
+            start_idx = rank * n + i * global_batch_size
+            end_idx = start_idx + n
+
+            z = all_z[start_idx:end_idx]
+            y = all_y[start_idx:end_idx]
+
+            # We only construct y-labels rigorously.
+            # Z is pure noise but must be scaled so it's not simply N(0, 1),
+            # Wait, no - standard DDPM/Diffusion starts from N(0, 1) and that is correct for the diffusion latent space
+            # as long as the inputs x_1 were scaled by 0.18215!
+            # The model is trained assuming X_1 is N(0, 1) distributed (which is why 0.18215 is used).
+            # So z = torch.randn(...) is actually perfectly correct!
+            z = torch.randn(n, model.in_channels, latent_size,
+                            latent_size, device=device)
+        else:
+            z = torch.randn(n, model.in_channels, latent_size,
+                            latent_size, device=device)
+            y = torch.randint(0, args.num_classes, (n,), device=device)
+
         # Setup classifier-free guidance:
         if using_cfg:
             z = torch.cat([z, z], 0)
@@ -186,12 +235,14 @@ def main(mode, args):
             samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
 
         samples = vae.decode(samples / 0.18215).sample
-        samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+        samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0,
+                                                                       2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
         # Save samples to disk as individual .png files
         for i, sample in enumerate(samples):
             index = i * dist.get_world_size() + rank + total
-            Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
+            Image.fromarray(sample).save(
+                f"{sample_folder_dir}/{index:06d}.png")
         total += global_batch_size
         dist.barrier()
 
@@ -211,39 +262,42 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: program.py <mode> [options]")
         sys.exit(1)
-    
-    mode = sys.argv[1]
-    
-    assert mode[:2] != "--", "Usage: program.py <mode> [options]"
-    assert mode in ["ODE", "SDE", "MIXED"], "Invalid mode. Please choose 'ODE', 'SDE', or 'MIXED'"
 
-    parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
-    parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
+    mode = sys.argv[1]
+
+    assert mode[:2] != "--", "Usage: program.py <mode> [options]"
+    assert mode in ["ODE", "SDE", "MIXED",
+                    "JUMP"], "Invalid mode. Please choose 'ODE', 'SDE', 'MIXED', or 'JUMP'"
+
+    parser.add_argument("--model", type=str,
+                        choices=list(SiT_models.keys()), default="SiT-XL/2")
+    parser.add_argument("--vae",  type=str,
+                        choices=["ema", "mse"], default="ema")
     parser.add_argument("--sample-dir", type=str, default="samples")
     parser.add_argument("--per-proc-batch-size", type=int, default=4)
     parser.add_argument("--num-fid-samples", type=int, default=50_000)
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image-size", type=int,
+                        choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--cfg-scale",  type=float, default=1.0)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
+    parser.add_argument("--test-trained-only", action="store_true",
+                        help="If enabled, forcefully samples using the exact 64 class labels from 0_0.npy and 0_1.npy that were used in training.")
     parser.add_argument("--num-bins", type=int, default=128)
     parser.add_argument("--jump-range", type=float, default=3.0)
     parser.add_argument("--ckpt", type=str, default=None,
-                        help="Optional path to a SiT checkpoint (default: auto-download a pre-trained SiT-XL/2 model).")
+                        help="Optional path to a SiT checkpoint.")
 
     parse_transport_args(parser)
     if mode == "ODE":
         parse_ode_args(parser)
-        # Further processing for ODE
     elif mode == "SDE":
         parse_sde_args(parser)
-        # Further processing for SDE
-    elif mode == "MIXED":
+    elif mode in ["MIXED", "JUMP"]:
         parse_ode_args(parser)
-        # Further processing for MIXED
 
     args = parser.parse_known_args()[0]
     main(mode, args)

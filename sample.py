@@ -55,7 +55,9 @@ def main(mode, args):
         args.prediction,
         args.loss_weight,
         args.train_eps,
-        args.sample_eps
+        args.sample_eps,
+        bregman_type=args.bregman_type,
+        time_schedule=args.time_schedule,
     )
     sampler = Sampler(transport)
     if mode == "ODE":

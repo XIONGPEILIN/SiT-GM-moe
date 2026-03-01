@@ -25,6 +25,7 @@ class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
     """
+
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -47,12 +48,14 @@ class TimestepEmbedder(nn.Module):
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
         half = dim // 2
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+            -math.log(max_period) * torch.arange(start=0,
+                                                 end=half, dtype=torch.float32) / half
         ).to(device=t.device)
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
     def forward(self, t):
@@ -65,10 +68,12 @@ class LabelEmbedder(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
     """
+
     def __init__(self, num_classes, hidden_size, dropout_prob):
         super().__init__()
         use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
+        self.embedding_table = nn.Embedding(
+            num_classes + use_cfg_embedding, hidden_size)
         self.num_classes = num_classes
         self.dropout_prob = dropout_prob
 
@@ -77,7 +82,8 @@ class LabelEmbedder(nn.Module):
         Drops labels to enable classifier-free guidance.
         """
         if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+            drop_ids = torch.rand(
+                labels.shape[0], device=labels.device) < self.dropout_prob
         else:
             drop_ids = force_drop_ids == 1
         labels = torch.where(drop_ids, self.num_classes, labels)
@@ -99,23 +105,33 @@ class SiTBlock(nn.Module):
     """
     A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
+
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm1 = nn.LayerNorm(
+            hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(
+            hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm2 = nn.LayerNorm(
+            hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        def approx_gelu(): return nn.GELU(approximate="tanh")
+        self.mlp = Mlp(in_features=hidden_size,
+                       hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
     def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
+            c).chunk(6, dim=1)
+        x = x + \
+            gate_msa.unsqueeze(
+                1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + \
+            gate_mlp.unsqueeze(
+                1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
 
@@ -123,10 +139,13 @@ class FinalLayer(nn.Module):
     """
     The final layer of SiT.
     """
+
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.norm_final = nn.LayerNorm(
+            hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(
+            hidden_size, patch_size * patch_size * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
@@ -143,6 +162,7 @@ class SiT(nn.Module):
     """
     Diffusion model with a Transformer backbone.
     """
+
     def __init__(
         self,
         input_size=32,
@@ -161,26 +181,32 @@ class SiT(nn.Module):
         super().__init__()
         self.learn_sigma = learn_sigma
         self.in_channels = in_channels
-        self.num_bins = num_bins
-        self.jump_range = jump_range
+        self.num_bins = num_bins  # Deprecating, keeping for interface compatibility
+        self.jump_range = jump_range  # Deprecating
         self.flow_channels = in_channels
-        self.jump_channels = in_channels * (num_bins + 1)
+        # Jump Head outputs: C for Mean (\mu), C for Log-Variance (\log \Sigma), and C for Intensity logits (\lambda)
+        self.jump_channels = in_channels * 3
         self.out_channels = self.flow_channels + self.jump_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
 
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        self.x_embedder = PatchEmbed(
+            input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.y_embedder = LabelEmbedder(
+            num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        self.pos_embed = nn.Parameter(torch.zeros(
+            1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
-        self.final_layer_flow = FinalLayer(hidden_size, patch_size, self.flow_channels)
-        self.final_layer_jump = FinalLayer(hidden_size, patch_size, self.jump_channels)
+        self.final_layer_flow = FinalLayer(
+            hidden_size, patch_size, self.flow_channels)
+        self.final_layer_jump = FinalLayer(
+            hidden_size, patch_size, self.jump_channels)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -193,8 +219,10 @@ class SiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        pos_embed = get_2d_sincos_pos_embed(
+            self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        self.pos_embed.data.copy_(
+            torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w = self.x_embedder.proj.weight.data
@@ -218,7 +246,7 @@ class SiT(nn.Module):
         nn.init.constant_(self.final_layer_flow.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer_flow.linear.weight, 0)
         nn.init.constant_(self.final_layer_flow.linear.bias, 0)
-        
+
         nn.init.constant_(self.final_layer_jump.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.final_layer_jump.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer_jump.linear.weight, 0)
@@ -246,56 +274,57 @@ class SiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        x = self.x_embedder(
+            x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
-            
-        x_flow = self.final_layer_flow(x, c)      # (N, T, patch_size ** 2 * flow_channels)
-        x_jump = self.final_layer_jump(x, c)      # (N, T, patch_size ** 2 * jump_channels)
-        
-        x_flow = self.unpatchify(x_flow, out_channels=self.flow_channels) # (N, flow_channels, H, W)
-        x_jump = self.unpatchify(x_jump, out_channels=self.jump_channels) # (N, jump_channels, H, W)
-        
+
+        # (N, T, patch_size ** 2 * flow_channels)
+        x_flow = self.final_layer_flow(x, c)
+        # (N, T, patch_size ** 2 * jump_channels)
+        x_jump = self.final_layer_jump(x, c)
+
+        # (N, flow_channels, H, W)
+        x_flow = self.unpatchify(x_flow, out_channels=self.flow_channels)
+        # (N, jump_channels, H, W)
+        x_jump = self.unpatchify(x_jump, out_channels=self.jump_channels)
+
         x = torch.cat([x_flow, x_jump], dim=1)    # (N, out_channels, H, W)
         # We don't chunk here because transport loss should handle the splitting of out_channels
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
-        Forward pass of SiT, but also batches the unconSiTional forward pass for classifier-free guidance.
+        Forward pass of SiT, using pre-batched conditional and unconditional inputs.
+        The external script (e.g., sample_ddp.py) has already expanded x, t, and y 
+        to size 2N, containing conditional and unconditional requests respectively.
         """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        model_out = self.forward(x, t, y)
+        eps, rest = model_out[:,
+                              :self.in_channels], model_out[:, self.in_channels:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
 
-        # Apply CFG to Jump Logits (J) but NOT to Jump Intensity (lambda)
+        # Apply CFG to Jump Mean (\mu) but NOT to Jump Variance (\log \Sigma) or Intensity (\lambda)
         cond_rest, uncond_rest = torch.split(rest, len(rest) // 2, dim=0)
-        B_orig, _, H, W = cond_rest.shape
-        C_in = self.in_channels
-        bins = self.num_bins
-        
-        # Reshape to (B, C, bins+1, H, W) to separate logits from intensity
-        cond_rest_r = cond_rest.view(B_orig, C_in, bins + 1, H, W)
-        uncond_rest_r = uncond_rest.view(B_orig, C_in, bins + 1, H, W)
-        
-        # Extract Logits and apply CFG
-        cond_J = cond_rest_r[:, :, :bins]
-        uncond_J = uncond_rest_r[:, :, :bins]
-        half_J = uncond_J + cfg_scale * (cond_J - uncond_J)
-        
-        # Keep intensity unguided (use conditional prediction)
-        half_lambda = cond_rest_r[:, :, bins:]
-        
-        # Reconstruct and return
-        half_rest = torch.cat([half_J, half_lambda], dim=2).view(B_orig, -1, H, W)
+
+        # Split features: first C is Mean, next C is Log-Variance, final C is Intensity
+        cond_mu = cond_rest[:, :self.in_channels]
+        uncond_mu = uncond_rest[:, :self.in_channels]
+
+        cond_logs = cond_rest[:, self.in_channels:2*self.in_channels]
+        cond_int = cond_rest[:, 2*self.in_channels:]
+
+        # Extrapolate Mean
+        half_mu = uncond_mu + cfg_scale * (cond_mu - uncond_mu)
+
+        # Reconstruct half response using Guided Mean, Conditional Variance and Conditional Intensity
+        half_rest = torch.cat([half_mu, cond_logs, cond_int], dim=1)
+
         rest = torch.cat([half_rest, half_rest], dim=0)
         return torch.cat([eps, rest], dim=1)
 
@@ -319,7 +348,8 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=
     grid = grid.reshape([2, 1, grid_size, grid_size])
     pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
     if cls_token and extra_tokens > 0:
-        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
+        pos_embed = np.concatenate(
+            [np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
     return pos_embed
 
 
@@ -327,10 +357,12 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     assert embed_dim % 2 == 0
 
     # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+    emb_h = get_1d_sincos_pos_embed_from_grid(
+        embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(
+        embed_dim // 2, grid[1])  # (H*W, D/2)
 
-    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
+    emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
     return emb
 
 
@@ -348,8 +380,8 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     pos = pos.reshape(-1)  # (M,)
     out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
 
-    emb_sin = np.sin(out) # (M, D/2)
-    emb_cos = np.cos(out) # (M, D/2)
+    emb_sin = np.sin(out)  # (M, D/2)
+    emb_cos = np.cos(out)  # (M, D/2)
 
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
@@ -362,35 +394,46 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 def SiT_XL_2(**kwargs):
     return SiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
+
 def SiT_XL_4(**kwargs):
     return SiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+
 
 def SiT_XL_8(**kwargs):
     return SiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
 
+
 def SiT_L_2(**kwargs):
     return SiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+
 
 def SiT_L_4(**kwargs):
     return SiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
 
+
 def SiT_L_8(**kwargs):
     return SiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
+
 
 def SiT_B_2(**kwargs):
     return SiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
+
 def SiT_B_4(**kwargs):
     return SiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
+
 
 def SiT_B_8(**kwargs):
     return SiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
 
+
 def SiT_S_2(**kwargs):
     return SiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
 
+
 def SiT_S_4(**kwargs):
     return SiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
+
 
 def SiT_S_8(**kwargs):
     return SiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)

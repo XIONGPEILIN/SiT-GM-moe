@@ -8,13 +8,13 @@
 # Args:
 #   CKPT_PATH   : Path to a trained SiT checkpoint (.pt file)
 #   SAMPLE_DIR  : Directory to save samples (default: samples_a100)
-#   MODE        : Sampling mode: ODE, SDE, or MIXED (default: MIXED)
+#   MODE        : Sampling mode: ODE, SDE, MIXED, or JUMP (default: JUMP)
 
 set -e
 
 CKPT_PATH="${1:?Error: CKPT_PATH is required. Usage: $0 <CKPT_PATH> [SAMPLE_DIR] [MODE]}"
 SAMPLE_DIR="${2:-samples_a6000}"
-MODE="${3:-MIXED}"
+MODE="${3:-JUMP}"
 
 # -------------------------------------------------------------------
 # Hardware: 8x A100 80GB
@@ -27,7 +27,7 @@ NUM_GPUS=8
 PER_PROC_BS=32
 NUM_FID_SAMPLES=50000
 NUM_STEPS=1000
-CFG_SCALE=1
+CFG_SCALE=4
 MODEL="SiT-XL/2"
 NUM_BINS=128
 JUMP_RANGE=3.0

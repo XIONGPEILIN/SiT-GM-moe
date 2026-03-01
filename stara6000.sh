@@ -14,7 +14,7 @@ set -e
 
 FEATURE_PATH="${1:-/home/yanai-lab/xiong-p/SiT-GM-moe/imagenet_feature}"
 RESULTS_DIR="${2:-results_a100/a6000}"
-CKPT_PATH="${3:-}"
+CKPT_PATH="${3:-results_a100/a6000/024-SiT-XL-2-Linear-velocity-None/checkpoints/0050000.pt}"
 
 # -------------------------------------------------------------------
 # Hardware: 8x GPU (e.g. A100 80GB or RTX 6000 96GB)
@@ -27,16 +27,20 @@ CKPT_PATH="${3:-}"
 NUM_GPUS=8
 GLOBAL_BATCH=64  
 MODEL="SiT-XL/2"
-NUM_BINS=1024
-JUMP_RANGE=4.0
 SAMPLER_TYPE="jump"
 TIME_SCHEDULE="linear"
 NUM_WORKERS=8
-MAX_TRAIN_SAMPLES=256
+MAX_TRAIN_SAMPLES=64
 
 CKPT_ARG=""
+RESUME_ARG=""
 if [ -n "$CKPT_PATH" ]; then
-    CKPT_ARG="--ckpt $CKPT_PATH"
+    # If it's a directory, treat it as an Accelerate resume checkpoint
+    if [ -d "$CKPT_PATH" ]; then
+        RESUME_ARG="--resume $CKPT_PATH"
+    else
+        CKPT_ARG="--ckpt $CKPT_PATH"
+    fi
 fi
 
 MAX_SAMPLES_ARG=""
@@ -51,24 +55,20 @@ fi
 # 1. Tree 算法：相比默认 Ring，Tree 在非均匀拓扑下更高效
 #    Ring 的环形路径必须经过最慢的跨 NUMA 链路两次
 #    Tree 可以减少跨 NUMA 通信次数（先 NUMA 内聚合，再跨 NUMA 合并）
-# export NCCL_ALGO=Tree,Ring
+export NCCL_ALGO=Tree,Ring
 
 # 2. 强制启用 NVLink P2P 传输，即使跨 NUMA 也尝试 P2P
 #    默认情况下 NCCL 可能因为跨 NUMA 而回退到 SHM(共享内存)拷贝
-# export NCCL_P2P_LEVEL=5
-# export NCCL_P2P_DISABLE=0
+export NCCL_P2P_LEVEL=5
+export NCCL_P2P_DISABLE=0
 
-# # 3. 共享内存缓冲区加大：跨 NUMA 回退到 SHM 时，加大缓冲区减少碎片传输
-# export NCCL_SHM_DISABLE=0
-# export NCCL_BUFFSIZE=16777216        # 16MB (默认 4MB)，减少传输次数
-# export NCCL_NTHREADS=512             # NCCL 内部线程数（默认 256），加速数据搬运
 
-# # 4. 优化 NUMA 亲和性：让每个 GPU 进程绑定到最近 of CPU 核心
-# #    避免 GPU 0-3 的进程跑到 NUMA 1 的 CPU 上导致额外的内存跨域访问
-# export NCCL_SOCKET_NTHREADS=4        # Socket 通信线程数
-# export NCCL_NSOCKS_PERTHREAD=4       # 每线程 socket 数
+# 4. 优化 NUMA 亲和性：让每个 GPU 进程绑定到最近 of CPU 核心
+#    避免 GPU 0-3 的进程跑到 NUMA 1 的 CPU 上导致额外的内存跨域访问
+export NCCL_SOCKET_NTHREADS=4        # Socket 通信线程数
+export NCCL_NSOCKS_PERTHREAD=4       # 每线程 socket 数
 
-# # 5. 调试信息（首次运行看通信路径是否正确，确认后可改为 WARN）
+# 5. 调试信息（首次运行看通信路径是否正确，确认后可改为 WARN）
 # export NCCL_DEBUG=INFO
 # export NCCL_DEBUG_SUBSYS=INIT,GRAPH
 
@@ -82,24 +82,23 @@ echo " Sampler: $SAMPLER_TYPE (Max Samples: $MAX_TRAIN_SAMPLES)"
 echo " NCCL: ALGO=$NCCL_ALGO P2P_LEVEL=$NCCL_P2P_LEVEL BUFFSIZE=$NCCL_BUFFSIZE"
 echo "=========================================="
 
-torchrun --nnodes=1 --nproc_per_node=$NUM_GPUS \
+accelerate launch --num_processes=$NUM_GPUS --mixed_precision=no \
     train.py \
     --model "$MODEL" \
     --feature-path "$FEATURE_PATH" \
     --results-dir "$RESULTS_DIR" \
     --global-batch-size $GLOBAL_BATCH \
     --num-workers $NUM_WORKERS \
-    --num-bins $NUM_BINS \
-    --jump-range $JUMP_RANGE \
     --sampler-type $SAMPLER_TYPE \
     --time-schedule $TIME_SCHEDULE \
     --epochs 1400000000 \
-    --log-every 1 \
-    --ckpt-every 50000 \
+    --log-every 10 \
+    --ckpt-every 10000 \
     --sample-every 10000000000000000000000000000000000000000000000000000000000000000000000000000 \
     --cfg-scale 4.0 \
     --wandb \
     --dataset-repeat 100000 \
     $MAX_SAMPLES_ARG \
-    $CKPT_ARG
+    $CKPT_ARG \
+    $RESUME_ARG
 
