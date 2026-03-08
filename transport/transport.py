@@ -139,31 +139,17 @@ class Transport:
 
         t_expand = path.expand_t_like_x(t, x0)
 
-        # Calculate alpha_t based on time schedule to use as jump probability
-        if getattr(self, "time_schedule", "linear") == "cubic":
-            alpha_t = 1 - (1 - t_expand)**3
-            d_alpha_t = 3 * (1 - t_expand)**2
-        else:
-            alpha_t = t_expand
-            d_alpha_t = 1.0
-
-        # Mixture Path: xt is a discrete per-pixel binary choice
-        # With probability alpha_t -> pixel = x1 (already jumped)
-        # With probability 1-alpha_t -> pixel = x0 (still noise)
-        # This matches the Mixture Path: p_t(·|z) = κ_t δ_z + (1-κ_t) p_0
-        jump_mask = th.bernoulli(alpha_t.expand_as(x0))
-        xt_mixture = jump_mask * x1 + (1 - jump_mask) * x0
-
-        # Use Mixture Path xt for jump training, CondOT xt for flow-only
-        xt = xt_mixture
+        # 统一使用 CondOT 路径
+        xt = xt_condot
         model_output = model(xt, t, **model_kwargs)
 
         C_in = xt.shape[1]
 
         if self.model_type == ModelType.VELOCITY:
-            # For VELOCITY model, we have incorporated jump head according to gm.md
+            # Model output layout: [flow_u | gauss_mu | intensity]
             u_theta = model_output[:, :C_in]
-            jump_head = model_output[:, C_in:]
+            mu_theta = model_output[:, C_in:2*C_in]
+            intensity_logits = model_output[:, 2*C_in:3*C_in]
 
             terms = {}
             terms['pred'] = u_theta
@@ -178,65 +164,52 @@ class Transport:
             else:
                 L_flow = (diff ** 2).mean()
 
-            # GM jump objective computation (alpha_t and d_alpha_t are calculated above)
-
-            # Pure Jump formulation (based on Mixture Path derivation)
-            # lambda_target (Chain rule: d_alpha_t * \lambda_{old}(alpha_t) )
-            lambda_target = d_alpha_t / ((1 - alpha_t) + 1e-8)
-            # Clamp to prevent numerical explosion near t=1.
-            # Relaxed max to 10000.0 to effectively represent probability 1.0 at final steps.
-            lambda_target = th.clamp(lambda_target, max=10000.0)
-
-            # target intensity should be 0 for pixels that already jumped (mixture path optimization)
-            lambda_target_masked = lambda_target * (1 - jump_mask)
-
-            # Predict
-            # Split jump_head into Mean, Log-Variance, and Intensity
-            mu_theta = jump_head[:, :C_in]
-            logvar_theta = jump_head[:, C_in:2*C_in]
-            intensity_logits = jump_head[:, 2*C_in:]
+            # CondOT Jump 解析解 (GM 论文 Eq. 2596)
+            k_t = xt**2 - (t_expand + 1) * xt * x1 - \
+                (1 - t_expand)**2 + t_expand * x1**2
+            lambda_target = th.clamp(k_t, min=0.0) / ((1 - t_expand)**3 + 1e-8)
+            # Relax the artificial clamp from 500 to a safer bound that allows sharp jumps near t=0.999
+            lambda_target = th.clamp(lambda_target, max=100000.0)
+            lambda_target_masked = lambda_target
 
             # Extract lambda intensity: Use EXP instead of SOFTPLUS (Crucial!)
             # Softplus with Poisson NLL has a bounded downward gradient (max 1), causing it to get "stuck" at high values.
             # Exp() is the natural link function for Poisson, providing symmetric restoring force: grad = lambda_theta - lambda_target.
-            # max=12.0 ensures lambda maxes around ~162754, sufficient for R -> 0.
-            clamped_logits = th.clamp(intensity_logits, min=-20.0, max=12.0)
+            # max=15.0 ensures lambda maxes around ~3.2M, providing enough dynamic range
+            clamped_logits = th.clamp(intensity_logits, min=-8.0, max=15.0)
             lambda_theta = th.exp(clamped_logits)
 
             # The Jump Ground Truth target is simply the un-noised data x1
             target_y = x1
 
             # Define Jump Loss
-            # 1. Intensity Match: Full Poisson KL Divergence
-            # D_KL(target || pred) >= 0. Derivative is same as paper's simplified loss.
-            loss_lambda = (lambda_theta - lambda_target_masked +
-                           lambda_target_masked * th.log((lambda_target_masked + 1e-8) / (lambda_theta + 1e-8))).mean()
+            # 1. Intensity Match: Poisson Bregman divergence (strictly >= 0)
+            # According to the CGM paper (Appendix E.3, Eq 2117-2120),
+            # The exact Bregman divergence for the Poisson jump kernel is:
+            # D(target, pred) = pred - target * log(pred) - (target - target * log(target))
+            # The last constant shift is formally part of the divergence definition.
+            poisson_min = lambda_target_masked - lambda_target_masked * \
+                th.log(lambda_target_masked + 1e-8)
+            loss_lambda = (lambda_theta - lambda_target_masked *
+                           clamped_logits - poisson_min).mean()
 
-            # 2. Location Match: Pure Gaussian NLL (paper's ELBO)
-            # -log N(z; mu, sigma^2) = 0.5*logvar + 0.5*(z-mu)^2/exp(logvar) + const
-            # This naturally balances mu accuracy vs variance without a hand-tuned target.
+            # 2. Laplace MAE (L1) (GM theory: Bregman divergence on Laplace kernel)
+            # We fix the Laplace scale `b` to the physical standard deviation (1-t)
+            # and ignore predicting the variance, resolving variance collapse completely.
+            b_t = (1.0 - t_expand) + 1e-8
+            l1_raw = th.abs(mu_theta - target_y)
+            loss_laplace_mu = l1_raw / b_t
 
-            # Sub-components for logging
-            loss_nll_mu_raw = 0.5 * (mu_theta - target_y)**2
-            loss_nll_mu = loss_nll_mu_raw * th.exp(-logvar_theta)
-            loss_nll_var = 0.5 * logvar_theta
-
-            loss_nll = loss_nll_mu + loss_nll_var
-
-            # Weight Location KL by temporal intensity target independently per channel.
-            loss_jump_distribution = (lambda_target_masked * loss_nll).mean()
-            loss_jump_mu = (lambda_target_masked * loss_nll_mu).mean()
-            loss_jump_mu_raw = (lambda_target_masked * loss_nll_mu_raw).mean()
-            loss_jump_var = (lambda_target_masked * loss_nll_var).mean()
-
-            L_jump_raw = loss_lambda + loss_jump_distribution
+            loss_jump_mu = (lambda_target_masked * loss_laplace_mu).mean()
+            L_jump_raw = loss_lambda + loss_jump_mu
 
             terms['loss_flow'] = L_flow
             terms['loss_jump'] = L_jump_raw
             terms['loss_jump_lambda'] = loss_lambda
             terms['loss_jump_mu'] = loss_jump_mu
-            terms['loss_jump_mu_raw'] = loss_jump_mu_raw
-            terms['loss_jump_var'] = loss_jump_var
+            terms['lambda_theta'] = lambda_theta.mean().detach()
+            terms['lambda_target'] = lambda_target_masked.mean().detach()
+            terms['mae'] = l1_raw.mean().detach()
             terms['loss'] = L_flow + L_jump_raw
 
         else:
@@ -314,10 +287,19 @@ class Transport:
         """member function for obtaining score of 
             x_t = alpha_t * x + sigma_t * eps"""
         if self.model_type == ModelType.NOISE:
-            score_fn = lambda x, t, model, **kwargs: model(
-                x, t, **kwargs) / -self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, x))[0]
+            def _score_fn(x, t, model, **kwargs):
+                out = model(x, t, **kwargs)
+                if out.shape[1] > x.shape[1]:
+                    out = out[:, :x.shape[1]]
+                return out / -self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, x))[0]
+            score_fn = _score_fn
         elif self.model_type == ModelType.SCORE:
-            score_fn = lambda x, t, model, **kwagrs: model(x, t, **kwagrs)
+            def _score_fn(x, t, model, **kwargs):
+                out = model(x, t, **kwargs)
+                if out.shape[1] > x.shape[1]:
+                    out = out[:, :x.shape[1]]
+                return out
+            score_fn = _score_fn
         elif self.model_type == ModelType.VELOCITY:
             def _score_fn(x, t, model, **kwargs):
                 out = model(x, t, **kwargs)
@@ -510,21 +492,18 @@ class Sampler:
     def sample_jump_flow(
         self,
         *,
-        num_steps=50,
-        reverse=False,
+        num_steps=250,
         pure_jump=False,
         stochastic_jump=True,
         jump_alpha=0.5,
-        flow_sampler="euler",
-        corrector_steps=0,
-        snr=0.1,
     ):
-        """returns a sampling function for mixed CTMC/SDE (Algorithm 2)
+        """returns a sampling function for mixed CTMC/SDE (Algorithm 2) - Euler MS method
         Args:
         - num_steps: the actual number of integration steps performed
-        - reverse: whether solving in reverse; default to False
+        - pure_jump: if True, sets jump_alpha to 1.0
+        - stochastic_jump: if True, adds noise to jump landing point
+        - jump_alpha: weight of the jump component
         """
-        # Note: Jump logic is currently only valid for forward generation (t=0 to t=1)
 
         if pure_jump:
             jump_alpha = 1.0
@@ -534,163 +513,79 @@ class Sampler:
             self.transport.sample_eps,
             sde=False,
             eval=True,
-            reverse=reverse,
+            reverse=False,
             last_step_size=0.0,
         )
 
-        t_list = th.linspace(t0, t1, num_steps)
-        dt = t_list[1] - t_list[0]
+        dt = (t1 - t0) / num_steps
 
         def _sample(init, model, **model_kwargs):
             x = init
             xs = [x]
-            has_module = hasattr(model, 'module')
-            base_model = model.module if has_module else model
-            in_channels = getattr(base_model, 'in_channels', x.shape[1])
 
-            for i, ti in tqdm(enumerate(t_list[:-1]), total=len(t_list)-1, desc="Jump Flow Euler (with PC support)"):
-                with th.no_grad():
-                    t_vec = th.ones(x.shape[0], device=x.device) * ti
+            for i in tqdm(range(num_steps), desc="Jump+Flow MS (Euler)"):
+                t = t0 + i * dt
 
-                    for _ in range(corrector_steps):
-                        score = self.score(x, t_vec, model, **model_kwargs)
-                        noise = th.randn_like(x)
-                        eps = snr * dt
-                        x = x + 0.5 * eps * score + th.sqrt(eps) * noise
+                C = x.shape[1]
+                t_vec = th.full((x.shape[0],), t, device=x.device)
 
-                    model_output = model(x, t_vec, **model_kwargs)
-                    current_alpha = jump_alpha
+                model_output = model(x, t_vec, **model_kwargs)
+                out_channels = model_output.shape[1]
 
-                    if model_output.shape[1] > in_channels:
-                        v_theta = model_output[:, :in_channels]
-                        jump_head = model_output[:, in_channels:]
-
-                        # Split Jump Head: mu for Mean, logs for Log-Variance (not used in PF-ODE), intensity for lambda
-                        mu_theta = jump_head[:, :in_channels]
-                        # logvar_theta reserved for stochastic sampling
-                        _ = jump_head[:, in_channels:2*in_channels]
-                        intensity_logits = jump_head[:, 2*in_channels:]
-
-                        clamped_logits = th.clamp(
-                            intensity_logits, min=-20.0, max=12.0)
-                        lambda_t = th.exp(clamped_logits)
-
-                        eps_val = 1e-5
-                        h = dt.item()
-
-                        if reverse:
-                            raise NotImplementedError(
-                                "Reverse sampling for Jumps not fully supported.")
-
-                        current_jump_weight = jump_alpha
-                        next_jump_weight = jump_alpha
-                        lambda_t_weighted = current_jump_weight * lambda_t
-
-                        # Use a 2nd-order trapezoidal approximation for:
-                        #   ∫_t^{t+h} lambda(s) ds ≈ 0.5 * h * (lambda_t + lambda_{t+h})
-                        # This is more accurate than Euler near t -> 1 where lambda varies fast.
-                        t_vec_hazard_next = th.ones(
-                            x.shape[0], device=x.device) * t_list[i + 1]
-                        model_output_hazard_next = model(
-                            x, t_vec_hazard_next, **model_kwargs)
-                        if model_output_hazard_next.shape[1] > in_channels:
-                            jump_head_next = model_output_hazard_next[:, in_channels:]
-                            intensity_logits_next = jump_head_next[:, 2 * in_channels:]
-                            clamped_logits_next = th.clamp(
-                                intensity_logits_next, min=-20.0, max=12.0)
-                            lambda_t_next = th.exp(clamped_logits_next)
-                        else:
-                            lambda_t_next = lambda_t
-
-                        lambda_t_weighted_next = next_jump_weight * lambda_t_next
-                        lambda_integral = 0.5 * h * \
-                            (lambda_t_weighted + lambda_t_weighted_next)
-                        R = th.exp(-lambda_integral)
-
-                        # --- Continuous Gaussian Jump (Deterministic vs Stochastic) ---
-                        # If stochastic_jump is True, we sample from N(\mu_theta, exp(logvar_theta))
-                        # otherwise we fall back to the deterministic expected value.
-                        if stochastic_jump:
-                            logvar_theta = jump_head[:,
-                                                     in_channels:2*in_channels]
-                            # Reparameterization trick: N(mu, sigma^2) = mu + sigma * N(0, 1)
-                            expected_y = mu_theta + \
-                                th.randn_like(mu_theta) * \
-                                th.exp(0.5 * logvar_theta)
-                        else:
-                            expected_y = mu_theta
-
-                        p_jump = th.clamp(1 - R, 0.0, 1.0)
-
-                        jump_vals = expected_y
-                        m = p_jump
-                    else:
-                        m = 0
-                        jump_vals = 0
-                        v_theta = model_output
-
-                    if pure_jump:
-                        # In pure jump mode, we completely ignore any continuous flow changes
-                        # because the flow branch is untrained and outputs random garbage.
-                        # We also skip the Heun corrector.
-                        x_continuous = x
-                    else:
-                        if self.transport.model_type == ModelType.NOISE:
-                            drift_mean, drift_var = self.transport.path_sampler.compute_drift(
-                                x, t_vec)
-                            sigma_t, _ = self.transport.path_sampler.compute_sigma_t(
-                                path.expand_t_like_x(t_vec, x))
-                            score = v_theta / -sigma_t
-                            c_drift = (-drift_mean + drift_var * score)
-                        elif self.transport.model_type == ModelType.SCORE:
-                            drift_mean, drift_var = self.transport.path_sampler.compute_drift(
-                                x, t_vec)
-                            c_drift = (-drift_mean + drift_var * v_theta)
-                        else:
-                            c_drift = v_theta
-
-                        c_drift = c_drift * (1.0 - current_alpha)
-                        x_continuous = x + c_drift * dt
-
-                        if flow_sampler == "heun" and i < len(t_list) - 2:
-                            t_vec_next = th.ones(
-                                x.shape[0], device=x.device) * t_list[i+1]
-                            model_output_next = model(
-                                x_continuous, t_vec_next, **model_kwargs)
-                            v_theta_next = model_output_next[:,
-                                                             :in_channels] if model_output_next.shape[1] > in_channels else model_output_next
-
-                            if self.transport.model_type == ModelType.NOISE:
-                                drift_mean_next, drift_var_next = self.transport.path_sampler.compute_drift(
-                                    x_continuous, t_vec_next)
-                                sigma_t_next, _ = self.transport.path_sampler.compute_sigma_t(
-                                    path.expand_t_like_x(t_vec_next, x_continuous))
-                                score_next = v_theta_next / -sigma_t_next
-                                c_drift_next = (-drift_mean_next +
-                                                drift_var_next * score_next)
-                            elif self.transport.model_type == ModelType.SCORE:
-                                drift_mean_next, drift_var_next = self.transport.path_sampler.compute_drift(
-                                    x_continuous, t_vec_next)
-                                c_drift_next = (-drift_mean_next +
-                                                drift_var_next * v_theta_next)
-                            else:
-                                c_drift_next = v_theta_next
-
-                            c_drift_next = c_drift_next * (1.0 - jump_alpha)
-                            x_continuous = x + 0.5 * \
-                                (c_drift + c_drift_next) * dt
-
-                    if isinstance(m, int) and m == 0:
-                        x = x_continuous
-                    else:
-                        # Mixture Path: Stochastic Bernoulli jump per pixel
-                        # Each pixel independently either teleports to
-                        # mu_theta or stays in place.
-                        jump_mask = th.bernoulli(m)
-                        x = jump_mask * jump_vals + \
-                            (1 - jump_mask) * x_continuous
-
+                # Laplace Jump-Flow [flow | mu | intensity]
+                if out_channels == 3 * C:
+                    v_theta_flow = model_output[:, :C]
+                    mu_theta = model_output[:, C:2*C]
+                    intensity = model_output[:, 2*C:3*C]
+                # Legacy Gaussian Jump-Flow [flow | mu | intensity | logvar]
+                elif out_channels == 4 * C:
+                    v_theta_flow = model_output[:, :C]
+                    mu_theta = model_output[:, C:2*C]
+                    intensity = model_output[:, 2*C:3*C]
+                    # log_var = model_output[:, 3*C:4*C] (unused in pure inference usually)
+                elif out_channels == C:  # Pure velocity / ODE model
+                    v_theta_flow = model_output
+                    x = x + v_theta_flow * dt
                     xs.append(x)
+                    continue
+                else:
+                    raise RuntimeError(
+                        f"Unexpected model output channels: {out_channels} for input channels: {C}")
+
+                lambda_t = th.exp(th.clamp(intensity, -8, 15.0))
+
+                # Approximate the integral of lambda_t
+                integral = 0.5 * lambda_t * \
+                    (1.0 - t) * (1.0 - ((1.0 - t)**2 / ((1.0 - t - dt)**2 + 1e-8)))
+                p_jump = 1.0 - th.exp(jump_alpha * integral)
+                p_jump = th.clamp(p_jump, 0.0, 1.0)
+
+                is_cfg = "cfg_scale" in model_kwargs
+                if is_cfg:
+                    half_N = x.shape[0] // 2
+                    p_jump_half = p_jump[:half_N]
+                    jump_mask_half = th.bernoulli(p_jump_half)
+                    jump_mask = th.cat([jump_mask_half, jump_mask_half], dim=0)
+                else:
+                    jump_mask = th.bernoulli(p_jump)
+
+                x_flow = x + (1.0 - jump_alpha) * v_theta_flow * dt
+
+                if stochastic_jump:
+                    # Use the physical, fixed scale (1-t) instead of the dead prediction `log_var`
+                    std = max(1.0 - t, 0.0)
+                    if is_cfg:
+                        noise_half = th.randn_like(x[:half_N])
+                        noise = th.cat([noise_half, noise_half], dim=0)
+                        x_jump = mu_theta + std * noise
+                    else:
+                        x_jump = mu_theta + std * th.randn_like(x)
+                else:
+                    x_jump = mu_theta
+
+                x = jump_mask * x_jump + (1 - jump_mask) * x_flow
+                xs.append(x)
+
             return xs
         return _sample
 

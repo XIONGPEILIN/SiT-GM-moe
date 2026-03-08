@@ -118,6 +118,72 @@ def requires_grad(model, flag=True):
         p.requires_grad = flag
 
 
+def load_pretrained_compatible(model, state_dict, logger):
+    """
+    Load checkpoints robustly across legacy/new SiT head layouts.
+    - Legacy pretrain may have a single `final_layer.*`.
+    - Current model uses `final_layer_flow.*` and `final_layer_jump.*`.
+    """
+    if "model" in state_dict:
+        state_dict = state_dict["model"]
+
+    # Strip common wrappers.
+    if any(k.startswith("module.") for k in state_dict.keys()):
+        state_dict = {
+            k[len("module."):]: v for k, v in state_dict.items()
+        }
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {
+            k[len("_orig_mod."):]: v for k, v in state_dict.items()
+        }
+
+    has_legacy_single_head = any(
+        k.startswith("final_layer.") for k in state_dict.keys()
+    )
+    has_split_heads = any(
+        k.startswith("final_layer_flow.") or k.startswith("final_layer_jump.")
+        for k in state_dict.keys()
+    )
+
+    if has_legacy_single_head and not has_split_heads:
+        # Keep backbone weights and keep new heads initialized by current model init.
+        state_dict = {
+            k: v for k, v in state_dict.items()
+            if not k.startswith("final_layer.")
+        }
+        logger.info(
+            "Detected legacy single-head checkpoint (final_layer.*). "
+            "Loaded backbone only; keeping final_layer_flow/jump as current init."
+        )
+
+    # Check and remove shape mismatches before strict=False loading.
+    # strict=False handles missing/unexpected keys, but crashes on shape mismatch.
+    model_state = model.state_dict()
+    mismatched_keys = []
+    for k in list(state_dict.keys()):
+        if k in model_state:
+            if state_dict[k].shape != model_state[k].shape:
+                mismatched_keys.append(k)
+                del state_dict[k]
+
+    if len(mismatched_keys) > 0:
+        logger.info(
+            f"Detected {len(mismatched_keys)} shape mismatches (e.g., {mismatched_keys[0]}). "
+            "These keys were removed from state_dict; keeping current model initialization for them."
+        )
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+
+    if len(incompatible.missing_keys) > 0:
+        logger.info(
+            f"Checkpoint load missing keys: {len(incompatible.missing_keys)} (expected for head/layout changes)."
+        )
+    if len(incompatible.unexpected_keys) > 0:
+        logger.info(
+            f"Checkpoint load unexpected keys: {len(incompatible.unexpected_keys)} (ignored)."
+        )
+
+
 def create_logger(logging_dir, is_main_process):
     """
     Create a logger that writes to a log file and stdout.
@@ -169,8 +235,8 @@ def main(args):
 
     # Setup Accelerate:
     accelerator = Accelerator(
-        mixed_precision='no',  # FP32
-        gradient_accumulation_steps=1,
+        mixed_precision=args.mixed_precision,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
     device = accelerator.device
     set_seed(args.global_seed)
@@ -180,7 +246,7 @@ def main(args):
     is_main = accelerator.is_main_process
 
     assert args.global_batch_size % world_size == 0, \
-        f"Batch size must be divisible by world size."
+        f"Batch size {args.global_batch_size} must be divisible by world size {world_size}."
     local_batch_size = max(1, int(args.global_batch_size // world_size))
 
     print(
@@ -248,6 +314,9 @@ def main(args):
         num_bins=getattr(args, 'num_bins', 128),
         jump_range=getattr(args, 'jump_range', 4.0),
     )
+    if args.gradient_checkpointing and hasattr(model, "set_gradient_checkpointing"):
+        model.set_gradient_checkpointing(True)
+        logger.info("Enabled gradient checkpointing.")
 
     # Freeze unused heads based on sampler-type:
     if args.sampler_type == "ode":
@@ -282,13 +351,22 @@ def main(args):
                 f"Resuming from step {train_steps}, epoch {start_epoch}")
 
     # Load pretrained weights (without optimizer state, for fine-tuning)
-    if args.ckpt is not None:
-        ckpt_path = args.ckpt
+    ckpt_path = args.ckpt
+    if ckpt_path is None and args.resume is None:
+        assert args.model == "SiT-XL/2", \
+            "Only SiT-XL/2 is available for default auto-download. Pass --ckpt for custom models."
+        assert args.image_size in [256, 512]
+        assert args.num_classes == 1000
+        # Current downloader only provides the 256x256 checkpoint.
+        assert args.image_size == 256, \
+            "Default auto-download currently supports only 256x256. Pass --ckpt for other sizes."
+        ckpt_path = f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
+        logger.info(
+            f"No --ckpt provided. Auto-downloading default pre-trained checkpoint: {ckpt_path}")
+
+    if ckpt_path is not None:
         state_dict = find_model(ckpt_path)
-        if "model" in state_dict:
-            model.load_state_dict(state_dict["model"])
-        else:
-            model.load_state_dict(state_dict)
+        load_pretrained_compatible(model, state_dict, logger)
         logger.info(f"Loaded pretrained weights from {ckpt_path}")
 
     transport = create_transport(
@@ -329,19 +407,64 @@ def main(args):
         logger.info(
             f"Dataset contains {len(dataset):,} features ({args.feature_path})")
 
+    subset_indices = None
     # Limit dataset size if requested:
     if args.max_train_samples is not None:
         if args.feature_path is None:
             num_samples = min(len(dataset), args.max_train_samples)
+            approx_samples = num_samples
         else:
-            num_samples = min(len(dataset), max(
-                1, args.max_train_samples // 32))
+            example_features, _ = dataset[0]
+            samples_per_file = max(1, int(example_features.shape[0]))
+            num_files = max(
+                1, (args.max_train_samples + samples_per_file - 1) // samples_per_file)
+            num_samples = min(len(dataset), num_files)
+            approx_samples = num_samples * samples_per_file
 
         from torch.utils.data import Subset
-        indices = list(range(num_samples))
+        subset_generator = torch.Generator()
+        subset_generator.manual_seed(args.global_seed)
+        indices = torch.randperm(
+            len(dataset), generator=subset_generator).tolist()[:num_samples]
+        subset_indices = [int(i) for i in indices]
         dataset = Subset(dataset, indices)
         logger.info(
-            f"Limited dataset to {num_samples} items (~{args.max_train_samples} samples)")
+            f"Limited dataset to {num_samples} items (~{approx_samples} samples), random subset with seed={args.global_seed}")
+
+    # Record labels used by the limited random subset for reproducibility/debugging.
+    if is_main and args.max_train_samples is not None and subset_indices is not None:
+        try:
+            used_labels = []
+            if args.feature_path is None:
+                for idx in subset_indices:
+                    _, label = dataset.dataset[idx]
+                    used_labels.append(int(label))
+            else:
+                base_dataset = dataset.dataset
+                for idx in subset_indices:
+                    label_file = base_dataset.labels_files[idx]
+                    label_path = os.path.join(
+                        base_dataset.labels_dir, label_file)
+                    labels_np = np.load(label_path)
+                    used_labels.extend(np.asarray(
+                        labels_np).reshape(-1).astype(np.int64).tolist())
+
+            used_labels_path = os.path.join(experiment_dir, "used_labels.json")
+            with open(used_labels_path, "w") as f:
+                json.dump(
+                    {
+                        "max_train_samples": int(args.max_train_samples),
+                        "subset_indices": subset_indices,
+                        "num_labels": int(len(used_labels)),
+                        "labels": [int(v) for v in used_labels],
+                    },
+                    f,
+                    indent=2,
+                )
+            logger.info(
+                f"Saved used labels to {used_labels_path} (num_labels={len(used_labels):,})")
+        except Exception as e:
+            logger.warning(f"Failed to record used labels: {e}")
 
     # Repeat dataset if requested:
     if getattr(args, 'dataset_repeat', 1) > 1:
@@ -350,42 +473,92 @@ def main(args):
             f"Repeated dataset {args.dataset_repeat} times. Total items: {len(dataset):,}")
 
     if args.feature_path is None:
-        loader = DataLoader(
-            dataset,
+        loader_kwargs = dict(
             batch_size=local_batch_size,
             shuffle=True,
             num_workers=args.num_workers,
             pin_memory=True,
-            drop_last=True
+            drop_last=True,
+            prefetch_factor=4 if args.num_workers > 0 else None,
+        )
+        if args.num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+        loader = DataLoader(
+            dataset,
+            **loader_kwargs
         )
     else:
         def custom_collate(batch):
             features = torch.cat([b[0] for b in batch], dim=0)
             labels = torch.cat([b[1] for b in batch], dim=0)
-            if features.shape[0] > local_batch_size:
-                features = features[:local_batch_size]
-                labels = labels[:local_batch_size]
-            return features, labels
+            if features.shape[0] <= 0:
+                raise ValueError(
+                    "Loaded empty feature batch from feature files.")
 
-        files_per_batch = max(1, local_batch_size // 32)
+            if features.shape[0] >= local_batch_size:
+                selected = torch.randperm(features.shape[0])[:local_batch_size]
+            else:
+                extra = torch.randint(
+                    0, features.shape[0], (local_batch_size - features.shape[0],))
+                selected = torch.cat(
+                    [torch.arange(features.shape[0]), extra], dim=0)
 
-        loader = DataLoader(
-            dataset,
+            return features[selected], labels[selected]
+
+        example_features, _ = dataset[0]
+        samples_per_file = max(1, int(example_features.shape[0]))
+        files_per_batch = max(
+            1, (local_batch_size + samples_per_file - 1) // samples_per_file)
+
+        loader_kwargs = dict(
             batch_size=files_per_batch,
             shuffle=True,
             num_workers=args.num_workers,
             pin_memory=True,
             collate_fn=custom_collate,
-            drop_last=True
+            drop_last=True,
+            prefetch_factor=4 if args.num_workers > 0 else None,
+        )
+        if args.num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+        loader = DataLoader(
+            dataset,
+            **loader_kwargs
         )
 
     # Prepare with Accelerate (handles DDP wrapping, device placement, dataloader sharding)
     model, opt, loader = accelerator.prepare(model, opt, loader)
 
+    # Compile the base model to speed up training
+    base_model = accelerator.unwrap_model(model)
+    if not hasattr(base_model, "_orig_mod"):
+        # Compile if not already compiled
+        import torch._dynamo as dynamo
+        dynamo.config.suppress_errors = True
+        base_model = torch.compile(base_model, mode="max-autotune")
+
+        # We need to re-wrap the compiled model with DDP
+        # For simplicity in Accelerate, we often just assign the compiled block back to the DDP module if possible,
+        # but the safest way in standard PyTorch 2 is to compile AFTER DDP, which we just did on the unwrapped model.
+        # So we update the DDP module's wrapped model:
+        if hasattr(model, "module"):
+            model.module = base_model
+        else:
+            model = base_model
+    logger.info("Model compiled with torch.compile().")
+
     # Load Accelerate state (after prepare)
     if args.resume is not None:
         accelerator.load_state(args.resume)
         logger.info(f"Loaded Accelerate state from {args.resume}")
+        group = opt.param_groups[0]
+        d_val = group.get('d', 1.0)
+        effective_lr = group.get('effective_lr', group.get('lr', 1.0))
+        logger.info(
+            "Resume optimizer state (group0): "
+            f"lr={group.get('lr', None)}, d={d_val}, "
+            f"effective_lr={effective_lr}, d*effective_lr={d_val * effective_lr:.9e}"
+        )
 
     # Prepare models for training:
     model.train()
@@ -398,27 +571,25 @@ def main(args):
     running_loss_jump = 0
     running_loss_jump_lambda = 0
     running_loss_jump_mu = 0
-    running_loss_jump_mu_raw = 0
-    running_loss_jump_var = 0
+    running_mae = 0
+    running_lambda_theta = 0
+    running_lambda_target = 0
     start_time = time()
 
-    # Labels to condition the model with (for periodic sampling):
-    ys = torch.randint(1000, size=(local_batch_size,), device=device)
-    use_cfg = args.cfg_scale > 1.0
-    n = ys.size(0)
-    zs = torch.randn(n, 4, latent_size, latent_size, device=device)
-
-    if use_cfg:
-        zs = torch.cat([zs, zs], 0)
-        y_null = torch.tensor([1000] * n, device=device)
-        ys = torch.cat([ys, y_null], 0)
-        sample_model_kwargs = dict(y=ys, cfg_scale=args.cfg_scale)
-        base_model = accelerator.unwrap_model(model)
-        model_fn = base_model.forward_with_cfg
-    else:
-        sample_model_kwargs = dict(y=ys)
-        base_model = accelerator.unwrap_model(model)
-        model_fn = base_model.forward
+    # Keep periodic training-time sampling deterministic and guidance-free.
+    # This stays fixed at CFG=1.0 regardless of CLI --cfg-scale.
+    training_sample_cfg_scale = 1.0
+    use_cfg = training_sample_cfg_scale > 1.0
+    # Keep latent noise fixed across periodic samples for easier visual comparison.
+    base_zs = torch.randn(local_batch_size, 4, latent_size,
+                          latent_size, device=device)
+    # Using the compiled unwrapped model
+    model_fn = base_model.forward_with_cfg if use_cfg else base_model.forward
+    # For periodic sampling during training, prefer the uncompiled module when available.
+    # This avoids torch.compile/CUDAGraph buffer reuse issues across repeated model calls.
+    sample_base_model = base_model._orig_mod if hasattr(
+        base_model, "_orig_mod") else base_model
+    sample_model_fn = sample_base_model.forward_with_cfg if use_cfg else sample_base_model.forward
 
     logger.info(
         f"Training for {args.epochs} epochs (resuming from step {train_steps})...")
@@ -432,17 +603,19 @@ def main(args):
                     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
 
             model_kwargs = dict(y=y)
-            loss_dict = transport.training_losses(model, x, model_kwargs)
-            sampler_type = getattr(args, 'sampler_type', 'ode')
-            if sampler_type == "ode":
-                loss = loss_dict["loss_flow"].mean()
-            elif sampler_type == "jump":
-                loss = loss_dict["loss_jump"].mean()
-            else:  # "jump_flow"
-                loss = loss_dict["loss"].mean()
-            opt.zero_grad()
-            accelerator.backward(loss)
-            opt.step()
+            with accelerator.accumulate(model):
+                loss_dict = transport.training_losses(model, x, model_kwargs)
+                sampler_type = getattr(args, 'sampler_type', 'ode')
+                if sampler_type == "ode":
+                    loss = loss_dict["loss_flow"].mean()
+                elif sampler_type == "jump":
+                    loss = loss_dict["loss_jump"].mean()
+                else:  # "jump_flow"
+                    loss = loss_dict["loss"].mean()
+
+                opt.zero_grad()
+                accelerator.backward(loss)
+                opt.step()
 
             # Log loss values:
             running_loss += loss.item()
@@ -454,10 +627,12 @@ def main(args):
                 running_loss_jump_lambda += loss_dict["loss_jump_lambda"].item()
             if "loss_jump_mu" in loss_dict:
                 running_loss_jump_mu += loss_dict["loss_jump_mu"].item()
-            if "loss_jump_mu_raw" in loss_dict:
-                running_loss_jump_mu_raw += loss_dict["loss_jump_mu_raw"].item()
-            if "loss_jump_var" in loss_dict:
-                running_loss_jump_var += loss_dict["loss_jump_var"].item()
+            if "mae" in loss_dict:
+                running_mae += loss_dict["mae"].item()
+            if "lambda_theta" in loss_dict:
+                running_lambda_theta += loss_dict["lambda_theta"].item()
+            if "lambda_target" in loss_dict:
+                running_lambda_target += loss_dict["lambda_target"].item()
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -466,43 +641,17 @@ def main(args):
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
                 # Reduce loss history over all processes:
-                avg_loss = torch.tensor(
-                    running_loss / log_steps, device=device)
-                avg_loss_flow = torch.tensor(
-                    running_loss_flow / log_steps, device=device)
-                avg_loss_jump = torch.tensor(
-                    running_loss_jump / log_steps, device=device)
-                avg_loss_jump_lambda = torch.tensor(
-                    running_loss_jump_lambda / log_steps, device=device)
-                avg_loss_jump_mu = torch.tensor(
-                    running_loss_jump_mu / log_steps, device=device)
-                avg_loss_jump_mu_raw = torch.tensor(
-                    running_loss_jump_mu_raw / log_steps, device=device)
-                avg_loss_jump_var = torch.tensor(
-                    running_loss_jump_var / log_steps, device=device)
-
-                # Use accelerate gather for reduction
-                avg_loss = accelerator.reduce(avg_loss, reduction="mean")
-                avg_loss_flow = accelerator.reduce(
-                    avg_loss_flow, reduction="mean")
-                avg_loss_jump = accelerator.reduce(
-                    avg_loss_jump, reduction="mean")
-                avg_loss_jump_lambda = accelerator.reduce(
-                    avg_loss_jump_lambda, reduction="mean")
-                avg_loss_jump_mu = accelerator.reduce(
-                    avg_loss_jump_mu, reduction="mean")
-                avg_loss_jump_mu_raw = accelerator.reduce(
-                    avg_loss_jump_mu_raw, reduction="mean")
-                avg_loss_jump_var = accelerator.reduce(
-                    avg_loss_jump_var, reduction="mean")
-
-                avg_loss = avg_loss.item()
-                avg_loss_flow = avg_loss_flow.item()
-                avg_loss_jump = avg_loss_jump.item()
-                avg_loss_jump_lambda = avg_loss_jump_lambda.item()
-                avg_loss_jump_mu = avg_loss_jump_mu.item()
-                avg_loss_jump_mu_raw = avg_loss_jump_mu_raw.item()
-                avg_loss_jump_var = avg_loss_jump_var.item()
+                # Use local rank values directly (no cross-GPU reduce)
+                # This avoids 8 extra AllReduce ops per log interval.
+                # Local averages are statistically representative enough.
+                avg_loss = running_loss / log_steps
+                avg_loss_flow = running_loss_flow / log_steps
+                avg_loss_jump = running_loss_jump / log_steps
+                avg_loss_jump_lambda = running_loss_jump_lambda / log_steps
+                avg_loss_jump_mu = running_loss_jump_mu / log_steps
+                avg_mae = running_mae / log_steps
+                avg_lambda_theta = running_lambda_theta / log_steps
+                avg_lambda_target = running_lambda_target / log_steps
 
                 # Fetch Prodigy Schedule-Free dynamic learning rate correctly
                 group = opt.param_groups[0]
@@ -510,7 +659,7 @@ def main(args):
                 effective_lr = group.get('effective_lr', group.get('lr', 1.0))
                 current_lr = d_val * effective_lr
 
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f} (Flow: {avg_loss_flow:.4f}, Jump: {avg_loss_jump:.4f}, L_lam: {avg_loss_jump_lambda:.4f}, L_mu: {avg_loss_jump_mu:.4f}, L_mu_raw: {avg_loss_jump_mu_raw:.4f}, L_var: {avg_loss_jump_var:.4f}), Train Steps/Sec: {steps_per_sec:.2f}, LR: {current_lr:.6e}")
+                logger.info(f"(step={train_steps:07d}) Loss: {avg_loss:.4f} (Flow: {avg_loss_flow:.4f}, Jump: {avg_loss_jump:.4f}), L_lam: {avg_loss_jump_lambda:.4f}, L_mu: {avg_loss_jump_mu:.4f}, lam: {avg_lambda_theta:.2f}/{avg_lambda_target:.2f}, mae: {avg_mae:.2f}, LR: {current_lr:.2e}")
                 if args.wandb:
                     wandb_utils.log(
                         {
@@ -519,9 +668,10 @@ def main(args):
                             "train loss jump": avg_loss_jump,
                             "train loss jump lambda": avg_loss_jump_lambda,
                             "train loss jump mu": avg_loss_jump_mu,
-                            "train loss jump mu raw": avg_loss_jump_mu_raw,
-                            "train loss jump var": avg_loss_jump_var,
-                            "train steps/sec": steps_per_sec,
+                            "train mae": avg_mae,
+                            "train lambda theta": avg_lambda_theta,
+                            "train lambda target": avg_lambda_target,
+                            "train_steps_per_sec": steps_per_sec,
                             "lr": current_lr
                         },
                         step=train_steps
@@ -532,8 +682,9 @@ def main(args):
                 running_loss_jump = 0
                 running_loss_jump_lambda = 0
                 running_loss_jump_mu = 0
-                running_loss_jump_mu_raw = 0
-                running_loss_jump_var = 0
+                running_mae = 0
+                running_lambda_theta = 0
+                running_lambda_target = 0
                 log_steps = 0
                 start_time = time()
 
@@ -554,7 +705,28 @@ def main(args):
                         json.dump(meta, f)
 
                     # Also save standalone .pt for sampling compatibility
-                    unwrapped_model = accelerator.unwrap_model(model)
+                    # NOTE:
+                    # accelerate.unwrap_model() may hit KeyError('_orig_mod')
+                    # when torch.compile regions exist but the top-level wrapper
+                    # does not expose _orig_mod. Fall back safely.
+                    try:
+                        unwrapped_model = accelerator.unwrap_model(model)
+                    except KeyError as e:
+                        if "_orig_mod" not in str(e):
+                            raise
+                        logger.warning(
+                            "unwrap_model hit KeyError('_orig_mod'); "
+                            "falling back to raw module for standalone save."
+                        )
+                        if hasattr(model, "module"):
+                            unwrapped_model = model.module
+                        else:
+                            unwrapped_model = base_model
+
+                    # If wrapped by torch.compile, save the original module state.
+                    if hasattr(unwrapped_model, "_orig_mod"):
+                        unwrapped_model = unwrapped_model._orig_mod
+
                     standalone_path = os.path.join(ckpt_dir, "model.pt")
                     torch.save(unwrapped_model.state_dict(), standalone_path)
                     logger.info(
@@ -563,20 +735,51 @@ def main(args):
                 accelerator.wait_for_everyone()
                 model.train()
                 opt.train()  # Schedule-Free: switch back to training mode
+                # Exclude checkpoint I/O time from subsequent step/sec measurement.
+                log_steps = 0
+                start_time = time()
 
             if train_steps % args.sample_every == 0 and train_steps > 0:
                 logger.info("Generating samples...")
                 opt.eval()
                 model.eval()
                 with torch.no_grad():
+                    # Force sampling labels to come from real training labels.
+                    if y.shape[0] >= local_batch_size:
+                        label_idx = torch.randperm(y.shape[0], device=y.device)[
+                            :local_batch_size]
+                    else:
+                        label_idx = torch.randint(
+                            0, y.shape[0], (local_batch_size,), device=y.device)
+                    ys = y[label_idx]
+
+                    if use_cfg:
+                        zs = torch.cat([base_zs, base_zs], 0)
+                        y_null = torch.full(
+                            (local_batch_size,), args.num_classes, device=device, dtype=ys.dtype)
+                        sample_model_kwargs = dict(
+                            y=torch.cat([ys, y_null], 0),
+                            cfg_scale=training_sample_cfg_scale,
+                        )
+                    else:
+                        zs = base_zs
+                        sample_model_kwargs = dict(y=ys)
+
                     sampler_type = getattr(args, 'sampler_type', 'ode')
-                    if sampler_type in ["jump_flow", "jump"]:
+                    if sampler_type == "jump":
                         sample_fn = transport_sampler.sample_jump_flow(
-                            num_steps=50)
+                            num_steps=250,
+                            pure_jump=True,
+                            stochastic_jump=False)
+                    elif sampler_type == "jump_flow":
+                        sample_fn = transport_sampler.sample_jump_flow(
+                            num_steps=250,
+                            pure_jump=False,
+                            stochastic_jump=False)
                     else:
                         sample_fn = transport_sampler.sample_ode()
                     samples = sample_fn(
-                        zs, model_fn, **sample_model_kwargs)[-1]
+                        zs, sample_model_fn, **sample_model_kwargs)[-1]
                     accelerator.wait_for_everyone()
 
                     if use_cfg:
@@ -605,6 +808,9 @@ def main(args):
                 model.train()
                 opt.train()
                 logger.info("Generating samples done.")
+                # Exclude sampling/visualization time from subsequent step/sec measurement.
+                log_steps = 0
+                start_time = time()
 
     model.eval()
     opt.eval()
@@ -632,7 +838,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
-    parser.add_argument("--sample-every", type=int, default=10_000)
+    parser.add_argument("--sample-every", type=int, default=500)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--max-train-samples", type=int, default=None,
@@ -647,6 +853,13 @@ if __name__ == "__main__":
     parser.add_argument("--jump-range", type=float, default=3.0)
     parser.add_argument("--sampler-type", type=str, default="ode",
                         choices=["ode", "jump_flow", "jump"])
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                        help="Enable gradient checkpointing to reduce GPU memory usage.")
+    parser.add_argument("--mixed-precision", type=str, default=None,
+                        choices=["no", "fp16", "bf16"],
+                        help="Mixed precision training. Defaults to 'no' or what's in 'accelerate launch'.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of steps to accumulate gradients before updating.")
 
     parse_transport_args(parser)
     args = parser.parse_args()

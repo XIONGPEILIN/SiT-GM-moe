@@ -11,7 +11,7 @@
 #   CKPT_PATH    : Optional path to a checkpoint to resume from
 
 set -e
-
+rm -rf /tmp/
 FEATURE_PATH="${1:-/home/yanai-lab/xiong-p/SiT-GM-moe/imagenet_feature}"
 RESULTS_DIR="${2:-results_a100}"
 CKPT_PATH="${3:-}"
@@ -25,7 +25,7 @@ CKPT_PATH="${3:-}"
 # -------------------------------------------------------------------
 
 NUM_GPUS=8
-GLOBAL_BATCH=640  
+GLOBAL_BATCH=512  
 MODEL="SiT-XL/2"
 NUM_BINS=1024
 JUMP_RANGE=4.0

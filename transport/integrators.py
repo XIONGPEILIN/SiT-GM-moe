@@ -27,7 +27,13 @@ class sde:
         self.sampler_type = sampler_type
 
     def __Euler_Maruyama_step(self, x, mean_x, t, model, **model_kwargs):
-        w_cur = th.randn(x.size()).to(x)
+        is_cfg = "cfg_scale" in model_kwargs
+        if is_cfg:
+            half_N = x.shape[0] // 2
+            w_half = th.randn(x[:half_N].size()).to(x)
+            w_cur = th.cat([w_half, w_half], dim=0)
+        else:
+            w_cur = th.randn(x.size()).to(x)
         t = th.ones(x.size(0)).to(x) * t
         dw = w_cur * th.sqrt(self.dt)
         drift = self.drift(x, t, model, **model_kwargs)
@@ -37,7 +43,13 @@ class sde:
         return x, mean_x
     
     def __Heun_step(self, x, _, t, model, **model_kwargs):
-        w_cur = th.randn(x.size()).to(x)
+        is_cfg = "cfg_scale" in model_kwargs
+        if is_cfg:
+            half_N = x.shape[0] // 2
+            w_half = th.randn(x[:half_N].size()).to(x)
+            w_cur = th.cat([w_half, w_half], dim=0)
+        else:
+            w_cur = th.randn(x.size()).to(x)
         dw = w_cur * th.sqrt(self.dt)
         t_cur = th.ones(x.size(0)).to(x) * t
         diffusion = self.diffusion(x, t_cur)

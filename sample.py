@@ -90,7 +90,8 @@ def main(mode, args):
     elif mode == "MIXED":
         sample_fn = sampler.sample_jump_flow(
             num_steps=args.num_sampling_steps,
-            reverse=args.reverse
+            stochastic_jump=args.stochastic_jump,
+            jump_alpha=0.5,  # Default MS weight from the plan
         )
     
 
@@ -142,6 +143,10 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-bins", type=int, default=128)
     parser.add_argument("--jump-range", type=float, default=3.0)
+    parser.add_argument("--stochastic-jump", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use Gaussian sampling for jump landing points with t-controlled variance.")
+    parser.add_argument("--jump-y-noise-scale", type=float, default=1.0,
+                        help="Scale for Gaussian std used in stochastic jump landing: y = mu + scale * sigma(t) * eps.")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a SiT checkpoint (default: auto-download a pre-trained SiT-XL/2 model).")
 

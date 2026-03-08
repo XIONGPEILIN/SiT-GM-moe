@@ -22,6 +22,7 @@ import numpy as np
 import math
 import argparse
 import sys
+import json
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -39,6 +40,73 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     np.savez(npz_path, arr_0=samples)
     print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
     return npz_path
+
+
+def _infer_used_labels_json_from_ckpt(ckpt_path):
+    """Infer used_labels.json path from checkpoint path."""
+    if ckpt_path is None:
+        return None
+    ckpt_abs = os.path.abspath(ckpt_path)
+    ckpt_dir = ckpt_abs if os.path.isdir(
+        ckpt_abs) else os.path.dirname(ckpt_abs)
+
+    candidates = [
+        os.path.join(os.path.dirname(ckpt_dir), "used_labels.json"),
+        os.path.join(os.path.dirname(
+            os.path.dirname(ckpt_dir)), "used_labels.json"),
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _load_test_trained_labels(args, device, rank):
+    """
+    Load class labels used for --test-trained-only.
+    Priority:
+    1) --train-labels-json
+    2) inferred used_labels.json from --ckpt
+    3) fallback npy labels (0_0.npy + 0_1.npy)
+    """
+    labels_path = args.train_labels_json
+    if labels_path is None:
+        labels_path = _infer_used_labels_json_from_ckpt(args.ckpt)
+
+    if labels_path is not None and os.path.isfile(labels_path):
+        with open(labels_path, "r") as f:
+            payload = json.load(f)
+        labels = payload["labels"] if isinstance(payload, dict) else payload
+        if not isinstance(labels, list) or len(labels) == 0:
+            raise ValueError(
+                f"Invalid labels payload in {labels_path}. "
+                "Expected non-empty list under key 'labels'."
+            )
+        y_all = torch.tensor(labels, device=device, dtype=torch.long)
+        if rank == 0:
+            print(
+                f"[test-trained-only] Loaded {y_all.numel()} labels from {labels_path}"
+            )
+        return y_all
+
+    # Backward-compatible fallback: first 64 labels from imagenet feature dump.
+    y0_path = os.path.join(args.trained_labels_npy_dir, "0_0.npy")
+    y1_path = os.path.join(args.trained_labels_npy_dir, "0_1.npy")
+    if os.path.isfile(y0_path) and os.path.isfile(y1_path):
+        y_0 = np.load(y0_path)
+        y_1 = np.load(y1_path)
+        y_all = torch.tensor(np.concatenate([y_0, y_1]), device=device).long()
+        if rank == 0:
+            print(
+                f"[test-trained-only] used_labels.json not found; "
+                f"fallback to {y0_path} + {y1_path} (num_labels={y_all.numel()})"
+            )
+        return y_all
+
+    raise FileNotFoundError(
+        "Could not load training labels for --test-trained-only. "
+        "Please provide --train-labels-json or ensure fallback npy exists."
+    )
 
 
 def main(mode, args):
@@ -121,16 +189,16 @@ def main(mode, args):
             last_step_size=args.last_step_size,
             num_steps=args.num_sampling_steps,
         )
-    elif mode == "MIXED":
+    elif mode in ["MIXED", "JUMP+FLOW"]:
         sample_fn = sampler.sample_jump_flow(
             num_steps=args.num_sampling_steps,
-            reverse=args.reverse
+            stochastic_jump=args.stochastic_jump,
         )
     elif mode == "JUMP":
         sample_fn = sampler.sample_jump_flow(
             num_steps=args.num_sampling_steps,
-            reverse=args.reverse,
-            pure_jump=True
+            pure_jump=True,
+            stochastic_jump=args.stochastic_jump,
         )
     vae = AutoencoderKL.from_pretrained(
         f"stabilityai/sd-vae-ft-{args.vae}").to(device)
@@ -150,10 +218,11 @@ def main(mode, args):
             f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
             f"{mode}-{args.num_sampling_steps}-{args.sampling_method}-"\
             f"{args.diffusion_form}-{args.last_step}-{args.last_step_size}"
-    elif mode in ["MIXED", "JUMP"]:
+    elif mode in ["MIXED", "JUMP", "JUMP+FLOW"]:
+        stoch_str = "stoch" if args.stochastic_jump else "det"
         folder_name = f"{model_string_name}-{ckpt_string_name}-" \
             f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
-            f"{mode}-{args.num_sampling_steps}"
+            f"{mode}-{args.num_sampling_steps}-{stoch_str}"
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
     if rank == 0:
         os.makedirs(sample_folder_dir, exist_ok=True)
@@ -183,35 +252,17 @@ def main(mode, args):
     pbar = range(done_iterations, iterations)
     pbar = tqdm(pbar) if rank == 0 else pbar
     total = done_iterations * global_batch_size
+    trained_labels = None
+    if getattr(args, "test_trained_only", False):
+        trained_labels = _load_test_trained_labels(args, device, rank)
 
     for i in pbar:
         # Sample inputs:
         if getattr(args, 'test_trained_only', False):
-            # Load exactly the first 64 features and labels
-            features_dir_y = "/home/yanai-lab/xiong-p/SiT-GM-moe/imagenet_feature/imagenet256_labels"
-            y_0 = np.load(f"{features_dir_y}/0_0.npy")
-            y_1 = np.load(f"{features_dir_y}/0_1.npy")
-            all_y = torch.tensor(np.concatenate(
-                [y_0, y_1]), device=device).long()
-
-            features_dir_z = "/home/yanai-lab/xiong-p/SiT-GM-moe/imagenet_feature/imagenet256_features"
-            z_0 = np.load(f"{features_dir_z}/0_0.npy")
-            z_1 = np.load(f"{features_dir_z}/0_1.npy")
-            all_z = torch.tensor(np.concatenate(
-                [z_0, z_1]), device=device, dtype=torch.float32)
-
             start_idx = rank * n + i * global_batch_size
-            end_idx = start_idx + n
-
-            z = all_z[start_idx:end_idx]
-            y = all_y[start_idx:end_idx]
-
-            # We only construct y-labels rigorously.
-            # Z is pure noise but must be scaled so it's not simply N(0, 1),
-            # Wait, no - standard DDPM/Diffusion starts from N(0, 1) and that is correct for the diffusion latent space
-            # as long as the inputs x_1 were scaled by 0.18215!
-            # The model is trained assuming X_1 is N(0, 1) distributed (which is why 0.18215 is used).
-            # So z = torch.randn(...) is actually perfectly correct!
+            label_indices = (torch.arange(start_idx, start_idx + n, device=device)
+                             % trained_labels.numel())
+            y = trained_labels[label_indices]
             z = torch.randn(n, model.in_channels, latent_size,
                             latent_size, device=device)
         else:
@@ -239,8 +290,8 @@ def main(mode, args):
                                                                        2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
         # Save samples to disk as individual .png files
-        for i, sample in enumerate(samples):
-            index = i * dist.get_world_size() + rank + total
+        for sample_idx, sample in enumerate(samples):
+            index = sample_idx * dist.get_world_size() + rank + total
             Image.fromarray(sample).save(
                 f"{sample_folder_dir}/{index:06d}.png")
         total += global_batch_size
@@ -266,8 +317,8 @@ if __name__ == "__main__":
     mode = sys.argv[1]
 
     assert mode[:2] != "--", "Usage: program.py <mode> [options]"
-    assert mode in ["ODE", "SDE", "MIXED",
-                    "JUMP"], "Invalid mode. Please choose 'ODE', 'SDE', 'MIXED', or 'JUMP'"
+    assert mode in ["ODE", "SDE", "MIXED", "JUMP",
+                    "JUMP+FLOW"], "Invalid mode. Please choose 'ODE', 'SDE', 'MIXED', 'JUMP' or 'JUMP+FLOW'"
 
     parser.add_argument("--model", type=str,
                         choices=list(SiT_models.keys()), default="SiT-XL/2")
@@ -285,9 +336,18 @@ if __name__ == "__main__":
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
     parser.add_argument("--test-trained-only", action="store_true",
-                        help="If enabled, forcefully samples using the exact 64 class labels from 0_0.npy and 0_1.npy that were used in training.")
+                        help="If enabled, sample using training labels: first from used_labels.json, then fallback to 0_0.npy/0_1.npy.")
+    parser.add_argument("--train-labels-json", type=str, default=None,
+                        help="Optional path to used_labels.json recorded during training.")
+    parser.add_argument("--trained-labels-npy-dir", type=str,
+                        default="/home/yanai-lab/xiong-p/SiT-GM-moe/imagenet_feature/imagenet256_labels",
+                        help="Fallback directory for label npy files (0_0.npy and 0_1.npy).")
     parser.add_argument("--num-bins", type=int, default=128)
     parser.add_argument("--jump-range", type=float, default=3.0)
+    parser.add_argument("--stochastic-jump", action=argparse.BooleanOptionalAction, default=False,
+                        help="Use Gaussian sampling for jump landing points with t-controlled variance. Disabled by default for deterministic jump sampling.")
+    parser.add_argument("--jump-y-noise-scale", type=float, default=1.0,
+                        help="Scale for Gaussian std used in stochastic jump landing: y = mu + scale * sigma(t) * eps.")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a SiT checkpoint.")
 
@@ -296,7 +356,7 @@ if __name__ == "__main__":
         parse_ode_args(parser)
     elif mode == "SDE":
         parse_sde_args(parser)
-    elif mode in ["MIXED", "JUMP"]:
+    elif mode in ["MIXED", "JUMP", "JUMP+FLOW"]:
         parse_ode_args(parser)
 
     args = parser.parse_known_args()[0]
