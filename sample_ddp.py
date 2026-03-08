@@ -113,6 +113,9 @@ def main(mode, args):
     """
     Run sampling.
     """
+    if mode in ["MIXED", "JUMP+FLOW"]:
+        mode = "JUMP_FLOW"
+
     torch.backends.cuda.matmul.allow_tf32 = args.tf32  # True: fast but may lead to some small numerical differences
     assert torch.cuda.is_available(
     ), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
@@ -160,7 +163,6 @@ def main(mode, args):
         args.train_eps,
         args.sample_eps,
         bregman_type=args.bregman_type,
-        time_schedule=args.time_schedule,
     )
     sampler = Sampler(transport)
     if mode == "ODE":
@@ -189,16 +191,18 @@ def main(mode, args):
             last_step_size=args.last_step_size,
             num_steps=args.num_sampling_steps,
         )
-    elif mode in ["MIXED", "JUMP+FLOW"]:
+    elif mode == "JUMP_FLOW":
         sample_fn = sampler.sample_jump_flow(
             num_steps=args.num_sampling_steps,
             stochastic_jump=args.stochastic_jump,
+            jump_y_noise_scale=args.jump_y_noise_scale,
         )
     elif mode == "JUMP":
         sample_fn = sampler.sample_jump_flow(
             num_steps=args.num_sampling_steps,
             pure_jump=True,
             stochastic_jump=args.stochastic_jump,
+            jump_y_noise_scale=args.jump_y_noise_scale,
         )
     vae = AutoencoderKL.from_pretrained(
         f"stabilityai/sd-vae-ft-{args.vae}").to(device)
@@ -218,7 +222,7 @@ def main(mode, args):
             f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
             f"{mode}-{args.num_sampling_steps}-{args.sampling_method}-"\
             f"{args.diffusion_form}-{args.last_step}-{args.last_step_size}"
-    elif mode in ["MIXED", "JUMP", "JUMP+FLOW"]:
+    elif mode in ["JUMP_FLOW", "JUMP"]:
         stoch_str = "stoch" if args.stochastic_jump else "det"
         folder_name = f"{model_string_name}-{ckpt_string_name}-" \
             f"cfg-{args.cfg_scale}-{args.per_proc_batch_size}-"\
@@ -317,8 +321,8 @@ if __name__ == "__main__":
     mode = sys.argv[1]
 
     assert mode[:2] != "--", "Usage: program.py <mode> [options]"
-    assert mode in ["ODE", "SDE", "MIXED", "JUMP",
-                    "JUMP+FLOW"], "Invalid mode. Please choose 'ODE', 'SDE', 'MIXED', 'JUMP' or 'JUMP+FLOW'"
+    assert mode in ["ODE", "SDE", "JUMP_FLOW", "MIXED", "JUMP", "JUMP+FLOW"], \
+        "Invalid mode. Please choose 'ODE', 'SDE', 'JUMP_FLOW', or 'JUMP'"
 
     parser.add_argument("--model", type=str,
                         choices=list(SiT_models.keys()), default="SiT-XL/2")
@@ -345,9 +349,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-bins", type=int, default=128)
     parser.add_argument("--jump-range", type=float, default=3.0)
     parser.add_argument("--stochastic-jump", action=argparse.BooleanOptionalAction, default=False,
-                        help="Use Gaussian sampling for jump landing points with t-controlled variance. Disabled by default for deterministic jump sampling.")
+                        help="Sample jump landings from the learned Gaussian jump kernel. Disabled by default for deterministic jump sampling.")
     parser.add_argument("--jump-y-noise-scale", type=float, default=1.0,
-                        help="Scale for Gaussian std used in stochastic jump landing: y = mu + scale * sigma(t) * eps.")
+                        help="Scale multiplier for the learned jump std used when --stochastic-jump is enabled.")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a SiT checkpoint.")
 
@@ -356,7 +360,7 @@ if __name__ == "__main__":
         parse_ode_args(parser)
     elif mode == "SDE":
         parse_sde_args(parser)
-    elif mode in ["MIXED", "JUMP", "JUMP+FLOW"]:
+    elif mode in ["JUMP_FLOW", "MIXED", "JUMP", "JUMP+FLOW"]:
         parse_ode_args(parser)
 
     args = parser.parse_known_args()[0]

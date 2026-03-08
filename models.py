@@ -61,6 +61,8 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        if hasattr(self.mlp[0], 'weight'):
+            t_freq = t_freq.to(dtype=self.mlp[0].weight.dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
 
@@ -185,10 +187,9 @@ class SiT(nn.Module):
         self.num_bins = num_bins  # Deprecating, keeping for interface compatibility
         self.jump_range = jump_range  # Deprecating
         self.flow_channels = in_channels           # C: Flow velocity u_theta
-        self.gauss_channels = in_channels           # C: Gaussian mean mu_theta
-        self.intensity_channels = in_channels       # C: Jump intensity logits
-        self.out_channels = (self.flow_channels + self.gauss_channels
-                             + self.intensity_channels)
+        # 2C: normalized jump parameters (d_theta, rho_raw_theta)
+        self.jump_channels = in_channels * 2
+        self.out_channels = self.flow_channels + self.jump_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.gradient_checkpointing = False
@@ -206,13 +207,10 @@ class SiT(nn.Module):
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
-        # 4 independent output heads, each with its own adaLN + linear projection
         self.final_layer_flow = FinalLayer(
             hidden_size, patch_size, self.flow_channels)
-        self.final_layer_gauss = FinalLayer(
-            hidden_size, patch_size, self.gauss_channels)
-        self.final_layer_intensity = FinalLayer(
-            hidden_size, patch_size, self.intensity_channels)
+        self.final_layer_jump = FinalLayer(
+            hidden_size, patch_size, self.jump_channels)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -247,13 +245,13 @@ class SiT(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
-        # Zero-out output layers (all 3 heads):
-        for head in [self.final_layer_flow, self.final_layer_gauss,
-                     self.final_layer_intensity]:
-            nn.init.constant_(head.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(head.adaLN_modulation[-1].bias, 0)
-            nn.init.constant_(head.linear.weight, 0)
-            nn.init.constant_(head.linear.bias, 0)
+        # Keep the flow head zero-initialized for stable ODE behavior.
+        nn.init.constant_(self.final_layer_flow.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer_flow.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer_flow.linear.weight, 0)
+        nn.init.constant_(self.final_layer_flow.linear.bias, 0)
+
+
 
     def unpatchify(self, x, out_channels=None):
         """
@@ -275,12 +273,12 @@ class SiT(nn.Module):
 
     def forward(self, x, t, y):
         """
-        Forward pass of SiT with 4 independent output heads.
+        Forward pass of SiT with 2 independent output heads.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
 
-        Returns: (N, 3C, H, W) = [flow_u | gauss_mu | intensity]
+        Returns: (N, 3C, H, W) = [flow_u | jump_d | jump_rho_raw]
         """
         x = self.x_embedder(
             x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
@@ -293,19 +291,16 @@ class SiT(nn.Module):
             else:
                 x = block(x, c)                  # (N, T, D)
 
-        # 3 independent heads from shared backbone features
+        # 2 independent heads from shared backbone features
         x_flow = self.final_layer_flow(x, c)
-        x_gauss = self.final_layer_gauss(x, c)
-        x_intensity = self.final_layer_intensity(x, c)
+        x_jump = self.final_layer_jump(x, c)
 
         # Unpatchify each head independently
         x_flow = self.unpatchify(x_flow, out_channels=self.flow_channels)
-        x_gauss = self.unpatchify(x_gauss, out_channels=self.gauss_channels)
-        x_intensity = self.unpatchify(
-            x_intensity, out_channels=self.intensity_channels)
+        x_jump = self.unpatchify(x_jump, out_channels=self.jump_channels)
 
-        # Concatenate: [flow_u | gauss_mu | intensity_logits]
-        x = torch.cat([x_flow, x_gauss, x_intensity], dim=1)
+        # Concatenate: [flow_u_C | jump_params_3C]
+        x = torch.cat([x_flow, x_jump], dim=1)
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
@@ -314,33 +309,35 @@ class SiT(nn.Module):
         The external script (e.g., sample_ddp.py) has already expanded x, t, and y 
         to size 2N, containing conditional and unconditional requests respectively.
 
-        Output layout: [flow_u | gauss_mu | intensity], each C channels.
-        CFG is applied to flow_u and gauss_mu.
-        Intensity uses conditional branch only (no CFG interpolation).
+        Output layout: [flow_u | jump_d | jump_s_raw | jump_rho_raw], each C channels.
+        CFG is applied to flow_u only.
+        Jump parameters use the conditional branch directly.
         """
         model_out = self.forward(x, t, y)
         C = self.in_channels
 
-        # Split into the 3 heads
+        # Split into the 2 heads logically
         flow_u = model_out[:, :C]
-        gauss_mu = model_out[:, C:2*C]
-        intensity = model_out[:, 2*C:3*C]
+        jump_params = model_out[:, C:3*C]
 
         # Split conditional / unconditional halves
         cond_flow, uncond_flow = torch.split(flow_u, len(flow_u) // 2, dim=0)
-        cond_mu, uncond_mu = torch.split(gauss_mu, len(gauss_mu) // 2, dim=0)
-        cond_int, _ = torch.split(intensity, len(intensity) // 2, dim=0)
+        cond_jump, uncond_jump = torch.split(jump_params, len(jump_params) // 2, dim=0)
 
-        # CFG on flow, mu
-        half_flow = uncond_flow + cfg_scale * (cond_flow - uncond_flow)
-        half_mu = uncond_mu + cfg_scale * (cond_mu - uncond_mu)
+        # CFG on flow ONLY
+        guided_flow = uncond_flow + cfg_scale * (cond_flow - uncond_flow)
 
-        # Intensity: conditional only (no CFG)
-        half_int = cond_int
+        # Jump parameters are used directly, but we need both conditional and unconditional parts
+        guided_jump = cond_jump 
 
-        # Reconstruct 2N output
-        half_out = torch.cat([half_flow, half_mu, half_int], dim=1)
-        return torch.cat([half_out, half_out], dim=0)
+        # Reconstruct the full 2N output
+        # The sampler expects the first half to be the guided conditional output
+        # and the second half to be the original unconditional output.
+        guided_out = torch.cat([guided_flow, guided_jump], dim=1)
+        uncond_out = torch.cat([uncond_flow, uncond_jump], dim=1)
+        
+        full_out = torch.cat([guided_out, uncond_out], dim=0)
+        return full_out
 
 
 #################################################################################
@@ -406,7 +403,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 #################################################################################
 
 def SiT_XL_2(**kwargs):
-    return SiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+    return SiT(depth=30, hidden_size=2880, patch_size=2, num_heads=24, **kwargs)
 
 
 def SiT_XL_4(**kwargs):

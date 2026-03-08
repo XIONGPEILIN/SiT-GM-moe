@@ -1,0 +1,36 @@
+{
+    "fp16": {
+        "enabled": "auto"
+    },
+    "bf16": {
+        "enabled": "auto"
+    },
+    "zero_optimization": {
+        "stage": 1,
+        "allgather_partitions": true,
+        "allgather_bucket_size": 2e8,
+        "overlap_comm": true,
+        "reduce_scatter": true,
+        "reduce_bucket_size": 2e8,
+        "contiguous_gradients": true
+    },
+    "optimizer": {
+        "type": "Muon",
+        "params": {
+            "lr": "auto",
+            "muon_lr": "auto",
+            "adam_lr": "auto",
+            "weight_decay": "auto",
+            "momentum": 0.95,
+            "betas": [0.9, 0.95],
+            "eps": 1e-8,
+            "ns_steps": 5
+        }
+    },
+    "gradient_accumulation_steps": "auto",
+    "gradient_clipping": "auto",
+    "steps_per_print": 10,
+    "train_batch_size": "auto",
+    "train_micro_batch_size_per_gpu": "auto",
+    "wall_clock_breakdown": false
+}

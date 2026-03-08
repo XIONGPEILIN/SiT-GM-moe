@@ -28,7 +28,6 @@ NUM_GPUS=8
 MODEL="SiT-XL/2"
 NUM_BINS=128
 JUMP_RANGE=3.0
-TIME_SCHEDULE="cubic"
 
 # Adjust batch size based on your available memory during evaluation.
 # Since we chunk the VAE, 16 per GPU is usually safe for A100 80GB
@@ -39,13 +38,13 @@ echo "=========================================="
 echo " SiT-GM-moe Evaluation on 80GB x${NUM_GPUS} (FP32)"
 echo " Checkpoint: $CKPT_PATH"
 echo " Sample Dir: $SAMPLE_DIR"
-echo " Model:      $MODEL ($TIME_SCHEDULE schedule)"
+echo " Model:      $MODEL"
 echo " Total generation: $NUM_SAMPLES images."
 echo "=========================================="
 
 /home/yanai-lab/xiong-p/SiT-GM-moe/.venv/bin/accelerate launch \
     --num_processes $NUM_GPUS \
-    sample_ddp.py MIXED \
+    sample_ddp.py JUMP_FLOW \
     --model "$MODEL" \
     --ckpt "$CKPT_PATH" \
     --sample-dir "$SAMPLE_DIR" \
@@ -55,7 +54,6 @@ echo "=========================================="
     --prediction velocity \
     --num-bins $NUM_BINS \
     --jump-range $JUMP_RANGE \
-    --time-schedule $TIME_SCHEDULE \
     --num-sampling-steps 50 \
     --cfg-scale 4.0 \
     --per-proc-batch-size $PER_PROC_BATCH_SIZE \

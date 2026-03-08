@@ -10,3 +10,6 @@ arXiv-2410.20587v3
 *.png
 results_a100
 imagenet_feature
+.cache/
+*.npz
+nccl_bench_logs

@@ -21,9 +21,15 @@ def find_model(model_name):
     else:
         assert os.path.isfile(
             model_name), f'Could not find SiT checkpoint at {model_name}'
-        checkpoint = torch.load(
-            model_name, map_location=lambda storage, loc: storage, weights_only=False)
-        if "ema" in checkpoint:  # supports old checkpoints
+        
+        if model_name.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            checkpoint = load_file(model_name, device="cpu")
+        else:
+            checkpoint = torch.load(
+                model_name, map_location=lambda storage, loc: storage, weights_only=False)
+            
+        if isinstance(checkpoint, dict) and "ema" in checkpoint:  # supports old checkpoints
             checkpoint = checkpoint["ema"]
         elif "model" in checkpoint:  # supports new checkpoints from schedule-free train.py
             checkpoint = checkpoint["model"]

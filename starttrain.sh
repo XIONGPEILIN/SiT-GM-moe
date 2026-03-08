@@ -21,7 +21,7 @@ CKPT_PATH="${3:-}"
 # Config:   SiT-XL/2, num_bins=128, jump_range=3.0
 # Batch:    128 per GPU (= 1024 global across 8 GPUs)
 # Precision: FP32 (Full Precision)
-# New Args:  Uses cubic time schedule and specific flow sampling args
+# New Args:  Uses the current fixed linear CondOT setup
 # -------------------------------------------------------------------
 
 NUM_GPUS=8
@@ -30,7 +30,6 @@ MODEL="SiT-XL/2"
 NUM_BINS=1024
 JUMP_RANGE=4.0
 SAMPLER_TYPE="jump"
-TIME_SCHEDULE="linear"
 NUM_WORKERS=3
 
 CKPT_ARG=""
@@ -70,7 +69,7 @@ echo "=========================================="
 echo " SiT-GM-moe Training on 48GB x${NUM_GPUS} (FP32)"
 echo " Feature Data: $FEATURE_PATH"
 echo " Results: $RESULTS_DIR"
-echo " Model:   $MODEL ($TIME_SCHEDULE schedule)"
+echo " Model:   $MODEL"
 echo " Global BS: $GLOBAL_BATCH  (${NUM_GPUS} GPUs × $((GLOBAL_BATCH / NUM_GPUS))/GPU)"
 echo " NCCL: ALGO=$NCCL_ALGO P2P_LEVEL=$NCCL_P2P_LEVEL BUFFSIZE=$NCCL_BUFFSIZE"
 echo "=========================================="
@@ -85,7 +84,6 @@ torchrun --nnodes=1 --nproc_per_node=$NUM_GPUS \
     --num-bins $NUM_BINS \
     --jump-range $JUMP_RANGE \
     --sampler-type $SAMPLER_TYPE \
-    --time-schedule $TIME_SCHEDULE \
     --epochs 14000 \
     --log-every 10 \
     --ckpt-every 50000 \
@@ -93,4 +91,3 @@ torchrun --nnodes=1 --nproc_per_node=$NUM_GPUS \
     --cfg-scale 4.0 \
     --wandb \
     $CKPT_ARG
-

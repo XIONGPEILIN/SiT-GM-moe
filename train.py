@@ -15,9 +15,9 @@ import json
 import os
 import logging
 import argparse
+from copy import deepcopy
 from time import time
 from glob import glob
-from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
 from PIL import Image
 from collections import OrderedDict
 import numpy as np
@@ -26,16 +26,17 @@ from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader
 import torch
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, DummyOptim
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True # 开启 cuDNN 自带的算法搜索
+import torch._inductor.config as inductor_config
 
 
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
-
 class CustomDataset(Dataset):
     def __init__(self, features_dir):
         json_path = os.path.join(features_dir, "file_list.json")
@@ -84,6 +85,20 @@ class CustomDataset(Dataset):
         features = np.load(os.path.join(self.features_dir, feature_file))
         labels = np.load(os.path.join(self.labels_dir, label_file))
         return torch.from_numpy(features), torch.from_numpy(labels)
+
+
+class MemmapDataset(Dataset):
+    def __init__(self, features_file, labels_file):
+        print(f"Loading MemmapDataset from {features_file}")
+        self.features = np.load(features_file, mmap_mode='r')
+        self.labels = np.load(labels_file, mmap_mode='r')
+
+    def __len__(self):
+        return self.features.shape[0]
+
+    def __getitem__(self, idx):
+        # Using .copy() avoids the "non-writable" warning and is safe for small slices
+        return torch.from_numpy(self.features[idx].copy()), torch.as_tensor(self.labels[idx])
 
 
 class RepeatedDataset(Dataset):
@@ -146,14 +161,18 @@ def load_pretrained_compatible(model, state_dict, logger):
     )
 
     if has_legacy_single_head and not has_split_heads:
-        # Keep backbone weights and keep new heads initialized by current model init.
-        state_dict = {
-            k: v for k, v in state_dict.items()
-            if not k.startswith("final_layer.")
-        }
+        # Map legacy final_layer.* to final_layer_flow.*
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("final_layer."):
+                new_key = k.replace("final_layer.", "final_layer_flow.")
+                new_state_dict[new_key] = v
+            else:
+                new_state_dict[k] = v
+        state_dict = new_state_dict
         logger.info(
             "Detected legacy single-head checkpoint (final_layer.*). "
-            "Loaded backbone only; keeping final_layer_flow/jump as current init."
+            "Mapped to final_layer_flow.*; keeping final_layer_jump as current init."
         )
 
     # Check and remove shape mismatches before strict=False loading.
@@ -235,7 +254,6 @@ def main(args):
 
     # Setup Accelerate:
     accelerator = Accelerator(
-        mixed_precision=args.mixed_precision,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
     device = accelerator.device
@@ -245,12 +263,13 @@ def main(args):
     world_size = accelerator.num_processes
     is_main = accelerator.is_main_process
 
-    assert args.global_batch_size % world_size == 0, \
-        f"Batch size {args.global_batch_size} must be divisible by world size {world_size}."
-    local_batch_size = max(1, int(args.global_batch_size // world_size))
+    assert args.global_batch_size % (world_size * args.gradient_accumulation_steps) == 0, \
+        f"Batch size {args.global_batch_size} must be divisible by world size {world_size} * accumulation {args.gradient_accumulation_steps}."
+    local_batch_size = max(1, int(
+        args.global_batch_size // (world_size * args.gradient_accumulation_steps)))
 
     print(
-        f"Starting rank={rank}, seed={args.global_seed}, world_size={world_size}.")
+        f"Starting rank={rank}, seed={args.global_seed}, world_size={world_size}. cuDNN={torch.backends.cudnn.version()}")
 
     # Setup an experiment folder:
     if is_main:
@@ -320,7 +339,7 @@ def main(args):
 
     # Freeze unused heads based on sampler-type:
     if args.sampler_type == "ode":
-        print("Training ODE ONLY: freezing jump head.")
+        print("Training ODE ONLY: freezing jump heads.")
         requires_grad(model.final_layer_jump, False)
     elif args.sampler_type == "jump":
         print("Training JUMP ONLY: freezing flow head.")
@@ -328,13 +347,63 @@ def main(args):
     elif args.sampler_type == "jump_flow":
         print("Training BOTH flow and jump heads.")
 
-    # Setup optimizer: ProdigyPlusScheduleFree
-    opt = ProdigyPlusScheduleFree(
-        model.parameters(), lr=1.0, betas=(0.95, 0.99),
-        weight_decay=0.0, d0=1e-6, d_coef=1.0,
-        use_stableadamw=True, use_schedulefree=True,
-        split_groups=True, factored=True,
-    )
+    # Setup optimizer: MuonWithAuxAdam
+    # Filter parameters for Muon (>= 2D hidden weights) vs AdamW (everything else)
+    muon_params = []
+    adam_params = []
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            # Use Muon for 2D+ weights in the transformer blocks
+            # Exclude embeddings and final output layers
+            if p.ndim >= 2 and "embed" not in name and "final_layer" not in name:
+                muon_params.append(p)
+            else:
+                adam_params.append(p)
+
+    # Setup optimizer:
+    # DeepSpeed Muon requires 'use_muon' attribute on ALL parameters.
+    for p in muon_params:
+        p.use_muon = True
+    for p in adam_params:
+        p.use_muon = False
+
+    if accelerator.state.deepspeed_plugin is not None and \
+       "optimizer" in accelerator.state.deepspeed_plugin.deepspeed_config:
+        # Manually fill "auto" fields in DeepSpeed config for custom Muon parameters.
+        # Accelerate's automatic mapping only works for standard optimizer fields.
+        ds_config = accelerator.state.deepspeed_plugin.deepspeed_config
+        ds_params = ds_config["optimizer"].get("params", {})
+        if ds_params.get("muon_lr") == "auto":
+            ds_params["muon_lr"] = args.muon_lr
+        if ds_params.get("adam_lr") == "auto":
+            ds_params["adam_lr"] = args.aux_adam_lr
+        if ds_params.get("weight_decay") == "auto":
+            ds_params["weight_decay"] = args.muon_weight_decay
+        if ds_params.get("lr") == "auto":
+            ds_params["lr"] = args.muon_lr
+
+        # Force BF16 and disable FP16 in DeepSpeed config
+        if "bf16" not in ds_config: ds_config["bf16"] = {}
+        ds_config["bf16"]["enabled"] = True
+        if "fp16" not in ds_config: ds_config["fp16"] = {}
+        ds_config["fp16"]["enabled"] = False
+        
+        # Force the model itself to bfloat16 before preparation
+        model = model.to(torch.bfloat16)
+        logger.info("Forced model to bfloat16 and enabled DeepSpeed BF16 mode.")
+        
+        # For DeepSpeed Muon, we pass the model parameters directly. 
+        # DeepSpeed internal optimizer will use the .use_muon attribute to group them.
+        opt = DummyOptim(model.parameters())
+        logger.info(f"Using DummyOptim for DeepSpeed-managed Muon optimizer. "
+                    f"Injected: muon_lr={args.muon_lr}, adam_lr={args.aux_adam_lr}")
+    else:
+        # Standard PyTorch optimizer still uses param_groups
+        param_groups = [
+            {"params": muon_params, "lr": args.muon_lr, "weight_decay": args.muon_weight_decay},
+            {"params": adam_params, "lr": args.aux_adam_lr, "weight_decay": args.aux_adam_weight_decay, "betas": (args.aux_adam_beta1, args.aux_adam_beta2), "eps": args.aux_adam_eps},
+        ]
+        opt = torch.optim.AdamW(param_groups)
 
     # Resume from Accelerate checkpoint directory
     train_steps = 0
@@ -352,22 +421,13 @@ def main(args):
 
     # Load pretrained weights (without optimizer state, for fine-tuning)
     ckpt_path = args.ckpt
-    if ckpt_path is None and args.resume is None:
-        assert args.model == "SiT-XL/2", \
-            "Only SiT-XL/2 is available for default auto-download. Pass --ckpt for custom models."
-        assert args.image_size in [256, 512]
-        assert args.num_classes == 1000
-        # Current downloader only provides the 256x256 checkpoint.
-        assert args.image_size == 256, \
-            "Default auto-download currently supports only 256x256. Pass --ckpt for other sizes."
-        ckpt_path = f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
-        logger.info(
-            f"No --ckpt provided. Auto-downloading default pre-trained checkpoint: {ckpt_path}")
-
     if ckpt_path is not None:
         state_dict = find_model(ckpt_path)
         load_pretrained_compatible(model, state_dict, logger)
         logger.info(f"Loaded pretrained weights from {ckpt_path}")
+    elif args.resume is None:
+        logger.info(
+            "No --ckpt and no --resume provided. Training from scratch.")
 
     transport = create_transport(
         args.path_type,
@@ -376,9 +436,11 @@ def main(args):
         args.train_eps,
         args.sample_eps,
         bregman_type=args.bregman_type,
-        time_schedule=args.time_schedule,
     )
     transport_sampler = Sampler(transport)
+    logger.info(
+        "Using fixed 1:1 Flow/Jump weighting for Markov Superposition."
+    )
     if args.feature_path is None or args.wandb:
         vae = AutoencoderKL.from_pretrained(
             f"stabilityai/sd-vae-ft-{args.vae}").to(device)
@@ -401,51 +463,79 @@ def main(args):
         logger.info(
             f"Dataset contains {len(dataset):,} images ({args.data_path})")
     else:
-        logger.info(
-            f"---> Preload Imagenet VAE features at {args.feature_path}...")
-        dataset = CustomDataset(args.feature_path)
-        logger.info(
-            f"Dataset contains {len(dataset):,} features ({args.feature_path})")
+        merged_features_path = os.path.join(
+            args.feature_path, "merged_features.npy")
+        merged_labels_path = os.path.join(
+            args.feature_path, "merged_labels.npy")
+        if os.path.exists(merged_features_path) and os.path.exists(merged_labels_path):
+            dataset = MemmapDataset(merged_features_path, merged_labels_path)
+            logger.info(
+                f"Using high-performance MemmapDataset: {len(dataset):,} total features")
+        else:
+            logger.info(
+                f"---> Preload Imagenet VAE features at {args.feature_path}...")
+            dataset = CustomDataset(args.feature_path)
+            logger.info(
+                f"Dataset contains {len(dataset):,} features ({args.feature_path})")
 
-    subset_indices = None
     # Limit dataset size if requested:
     if args.max_train_samples is not None:
-        if args.feature_path is None:
-            num_samples = min(len(dataset), args.max_train_samples)
-            approx_samples = num_samples
-        else:
-            example_features, _ = dataset[0]
-            samples_per_file = max(1, int(example_features.shape[0]))
-            num_files = max(
-                1, (args.max_train_samples + samples_per_file - 1) // samples_per_file)
-            num_samples = min(len(dataset), num_files)
-            approx_samples = num_samples * samples_per_file
+        num_samples = min(len(dataset), args.max_train_samples)
 
         from torch.utils.data import Subset
+        import random
         subset_generator = torch.Generator()
         subset_generator.manual_seed(args.global_seed)
-        indices = torch.randperm(
-            len(dataset), generator=subset_generator).tolist()[:num_samples]
+        indices = torch.randperm(len(dataset), generator=subset_generator).tolist()[
+            :num_samples]
         subset_indices = [int(i) for i in indices]
         dataset = Subset(dataset, indices)
         logger.info(
-            f"Limited dataset to {num_samples} items (~{approx_samples} samples), random subset with seed={args.global_seed}")
+            f"Limited dataset to {num_samples} items, random subset seed={args.global_seed}")
+
+    # Safety Guard: Check if repeat factor causes massive index lists (> 5M items)
+    base_len = len(dataset)
+    repeat_factor = getattr(args, 'dataset_repeat', 1)
+    if repeat_factor > 1:
+        if base_len > 200_000:
+            logger.warning(f"Dataset is too large ({base_len:,}) to repeat {repeat_factor}x. "
+                           "To prevent memory OOM in Sampler, forcing repeat=1. "
+                           "Please increase --epochs instead.")
+            args.dataset_repeat = 1
+        elif base_len * repeat_factor > 5_000_000:
+            new_repeat = 5_000_000 // base_len
+            logger.warning(f"Repeat factor {repeat_factor} results in {base_len * repeat_factor:,} items. "
+                           f"Capping repeat to {new_repeat} to save memory.")
+            args.dataset_repeat = new_repeat
+
+    # Repeat dataset for longer epochs
+    if getattr(args, 'dataset_repeat', 1) > 1:
+        dataset = RepeatedDataset(dataset, args.dataset_repeat)
+        logger.info(
+            f"Repeating dataset {args.dataset_repeat} times. Effective length: {len(dataset):,}")
 
     # Record labels used by the limited random subset for reproducibility/debugging.
     if is_main and args.max_train_samples is not None and subset_indices is not None:
         try:
             used_labels = []
+            # Find the actual data-holding dataset
+            _base = dataset
+            while hasattr(_base, 'dataset'):
+                _base = _base.dataset
+
             if args.feature_path is None:
                 for idx in subset_indices:
-                    _, label = dataset.dataset[idx]
+                    _, label = _base[idx]
                     used_labels.append(int(label))
             else:
-                base_dataset = dataset.dataset
                 for idx in subset_indices:
-                    label_file = base_dataset.labels_files[idx]
-                    label_path = os.path.join(
-                        base_dataset.labels_dir, label_file)
-                    labels_np = np.load(label_path)
+                    if hasattr(_base, 'labels_files'):  # CustomDataset
+                        label_file = _base.labels_files[idx]
+                        label_path = os.path.join(_base.labels_dir, label_file)
+                        labels_np = np.load(label_path)
+                    else:  # MemmapDataset
+                        labels_np = _base.labels[idx]
+
                     used_labels.extend(np.asarray(
                         labels_np).reshape(-1).astype(np.int64).tolist())
 
@@ -466,18 +556,19 @@ def main(args):
         except Exception as e:
             logger.warning(f"Failed to record used labels: {e}")
 
-    # Repeat dataset if requested:
-    if getattr(args, 'dataset_repeat', 1) > 1:
-        dataset = RepeatedDataset(dataset, args.dataset_repeat)
-        logger.info(
-            f"Repeated dataset {args.dataset_repeat} times. Total items: {len(dataset):,}")
+    _base_dataset = dataset
+    while hasattr(_base_dataset, 'dataset'):
+        _base_dataset = _base_dataset.dataset
 
-    if args.feature_path is None:
+    is_memmap_or_image = args.feature_path is None or isinstance(
+        _base_dataset, MemmapDataset)
+
+    if is_memmap_or_image:
         loader_kwargs = dict(
             batch_size=local_batch_size,
             shuffle=True,
             num_workers=args.num_workers,
-            pin_memory=True,
+            pin_memory=False,
             drop_last=True,
             prefetch_factor=4 if args.num_workers > 0 else None,
         )
@@ -526,54 +617,91 @@ def main(args):
             **loader_kwargs
         )
 
+    # torch.compile — must happen BEFORE accelerator.prepare() so that the
+    # compiled graph sees the raw module, not the DDP/DeepSpeed wrapper.
+    if getattr(args, 'compile', False):
+        compile_mode = getattr(args, 'compile_mode', 'reduce-overhead')
+
+        # Apply inductor tuning knobs only if supported by the current torch build.
+        inductor_toggles = {
+            "max_autotune": True,
+            "cudnn_prologue_fusion": True,
+            "epilogue_fusion": True,
+            "shape_padding": True,
+        }
+        for key, value in inductor_toggles.items():
+            if hasattr(inductor_config, key):
+                setattr(inductor_config, key, value)
+            else:
+                logger.warning(
+                    f"torch._inductor.config.{key} is unavailable in this torch version; skipping."
+                )
+        
+        logger.info(f"Compiling model with torch.compile (mode='{compile_mode}') ...")
+        # model = torch.compile(model, mode=compile_mode)
+        logger.info("torch.compile() done.")
+
     # Prepare with Accelerate (handles DDP wrapping, device placement, dataloader sharding)
     model, opt, loader = accelerator.prepare(model, opt, loader)
 
-    # Compile the base model to speed up training
-    base_model = accelerator.unwrap_model(model)
-    if not hasattr(base_model, "_orig_mod"):
-        # Compile if not already compiled
-        import torch._dynamo as dynamo
-        dynamo.config.suppress_errors = True
-        base_model = torch.compile(base_model, mode="max-autotune")
+    # Enable gradient communication compression hook (massive PCIe bandwidth savings)
+    if accelerator.num_processes > 1 and hasattr(model, 'register_comm_hook'):
+        import torch.distributed.algorithms.ddp_comm_hooks.default_hooks as comm_hooks
+        if accelerator.mixed_precision == 'bf16':
+            model.register_comm_hook(
+                state=None, hook=comm_hooks.bf16_compress_hook)
+            logger.info(
+                "Enabled BF16 gradient communication compression hook (payload reduced by 50%).")
+        elif accelerator.mixed_precision == 'fp16':
+            model.register_comm_hook(
+                state=None, hook=comm_hooks.fp16_compress_hook)
+            logger.info(
+                "Enabled FP16 gradient communication compression hook (payload reduced by 50%).")
 
-        # We need to re-wrap the compiled model with DDP
-        # For simplicity in Accelerate, we often just assign the compiled block back to the DDP module if possible,
-        # but the safest way in standard PyTorch 2 is to compile AFTER DDP, which we just did on the unwrapped model.
-        # So we update the DDP module's wrapped model:
+    # Extract the base model for compilation tracking or raw sampling functions later.
+    # accelerator.unwrap_model() can raise KeyError('_orig_mod') when torch.compile
+    # is used *before* accelerator.prepare(), because the DDP wrapper does not expose
+    # the compiled module's _orig_mod attribute at its own __dict__ level.
+    try:
+        base_model = accelerator.unwrap_model(model)
+    except KeyError as e:
+        if "_orig_mod" not in str(e):
+            raise
+        logger.warning(
+            "unwrap_model hit KeyError('_orig_mod'); "
+            "falling back to model.module for base_model."
+        )
         if hasattr(model, "module"):
-            model.module = base_model
+            base_model = model.module
         else:
-            model = base_model
-    logger.info("Model compiled with torch.compile().")
+            base_model = model
 
     # Load Accelerate state (after prepare)
     if args.resume is not None:
         accelerator.load_state(args.resume)
         logger.info(f"Loaded Accelerate state from {args.resume}")
-        group = opt.param_groups[0]
-        d_val = group.get('d', 1.0)
-        effective_lr = group.get('effective_lr', group.get('lr', 1.0))
-        logger.info(
-            "Resume optimizer state (group0): "
-            f"lr={group.get('lr', None)}, d={d_val}, "
-            f"effective_lr={effective_lr}, d*effective_lr={d_val * effective_lr:.9e}"
-        )
+        # group = opt.param_groups[0]
+        # d_val = group.get('d', 1.0)
+        # effective_lr = group.get('effective_lr', group.get('lr', 1.0))
+        # logger.info(
+        #     "Resume optimizer state (group0): "
+        #     f"lr={group.get('lr', None)}, d={d_val}, "
+        #     f"effective_lr={effective_lr}, d*effective_lr={d_val * effective_lr:.9e}"
+        # )
 
     # Prepare models for training:
     model.train()
-    opt.train()  # Schedule-Free: switch to training mode
 
     # Variables for monitoring/logging purposes:
     log_steps = 0
     running_loss = 0
     running_loss_flow = 0
     running_loss_jump = 0
-    running_loss_jump_lambda = 0
-    running_loss_jump_mu = 0
-    running_mae = 0
+    running_jump_rmse = 0
     running_lambda_theta = 0
     running_lambda_target = 0
+    running_jump_var_theta = 0
+    running_jump_var_target = 0
     start_time = time()
 
     # Keep periodic training-time sampling deterministic and guidance-free.
@@ -589,14 +717,45 @@ def main(args):
     # This avoids torch.compile/CUDAGraph buffer reuse issues across repeated model calls.
     sample_base_model = base_model._orig_mod if hasattr(
         base_model, "_orig_mod") else base_model
-    sample_model_fn = sample_base_model.forward_with_cfg if use_cfg else sample_base_model.forward
+
+    # Keep an EMA copy for more stable evaluation/sampling checkpoints.
+    ema_model = None
+    if args.ema:
+        ema_model = deepcopy(sample_base_model).to(device)
+        requires_grad(ema_model, False)
+        ema_model.eval()
+        if args.resume is not None and getattr(args, "ema_resume", True):
+            # Try to load EMA from .safetensors first, then fall back to .pt
+            ema_safetensors_path = os.path.join(args.resume, "ema.safetensors")
+            ema_pt_path = os.path.join(args.resume, "ema.pt")
+            
+            ema_state = None
+            if os.path.exists(ema_safetensors_path):
+                from safetensors.torch import load_file
+                ema_state = load_file(ema_safetensors_path, device=str(device))
+                logger.info(f"Loaded EMA weights from {ema_safetensors_path} (.safetensors)")
+            elif os.path.exists(ema_pt_path):
+                ema_state = torch.load(ema_pt_path, map_location=device, weights_only=True)
+                logger.info(f"Loaded EMA weights from {ema_pt_path} (.pt)")
+                
+            if ema_state is not None:
+                ema_model.load_state_dict(ema_state, strict=False)
+            else:
+                logger.warning(
+                    f"EMA checkpoint not found in {args.resume}; initializing EMA from current model weights."
+                )
+
+    sample_runtime_model = ema_model if (args.sample_use_ema and ema_model is not None) else sample_base_model
+    sample_model_fn = sample_runtime_model.forward_with_cfg if use_cfg else sample_runtime_model.forward
 
     logger.info(
         f"Training for {args.epochs} epochs (resuming from step {train_steps})...")
     for epoch in range(start_epoch, args.epochs):
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
-            x = x.to(device)
+            target_dtype = torch.bfloat16 if accelerator.mixed_precision == 'bf16' else (
+                torch.float16 if accelerator.mixed_precision == 'fp16' else torch.float32)
+            x = x.to(device, dtype=target_dtype)
             y = y.to(device)
             if args.feature_path is None:
                 with torch.no_grad():
@@ -616,6 +775,8 @@ def main(args):
                 opt.zero_grad()
                 accelerator.backward(loss)
                 opt.step()
+                if ema_model is not None:
+                    update_ema(ema_model, sample_base_model, decay=args.ema_decay)
 
             # Log loss values:
             running_loss += loss.item()
@@ -623,16 +784,16 @@ def main(args):
                 running_loss_flow += loss_dict["loss_flow"].item()
             if "loss_jump" in loss_dict:
                 running_loss_jump += loss_dict["loss_jump"].item()
-            if "loss_jump_lambda" in loss_dict:
-                running_loss_jump_lambda += loss_dict["loss_jump_lambda"].item()
-            if "loss_jump_mu" in loss_dict:
-                running_loss_jump_mu += loss_dict["loss_jump_mu"].item()
-            if "mae" in loss_dict:
-                running_mae += loss_dict["mae"].item()
+            if "jump_rmse" in loss_dict:
+                running_jump_rmse += loss_dict["jump_rmse"].item()
             if "lambda_theta" in loss_dict:
                 running_lambda_theta += loss_dict["lambda_theta"].item()
             if "lambda_target" in loss_dict:
                 running_lambda_target += loss_dict["lambda_target"].item()
+            if "jump_var_theta" in loss_dict:
+                running_jump_var_theta += loss_dict["jump_var_theta"].item()
+            if "jump_var_target" in loss_dict:
+                running_jump_var_target += loss_dict["jump_var_target"].item()
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -647,32 +808,40 @@ def main(args):
                 avg_loss = running_loss / log_steps
                 avg_loss_flow = running_loss_flow / log_steps
                 avg_loss_jump = running_loss_jump / log_steps
-                avg_loss_jump_lambda = running_loss_jump_lambda / log_steps
-                avg_loss_jump_mu = running_loss_jump_mu / log_steps
-                avg_mae = running_mae / log_steps
+                avg_jump_rmse = running_jump_rmse / log_steps
                 avg_lambda_theta = running_lambda_theta / log_steps
                 avg_lambda_target = running_lambda_target / log_steps
+                avg_jump_var_theta = running_jump_var_theta / log_steps
+                avg_jump_var_target = running_jump_var_target / log_steps
+                avg_lambda_ratio = avg_lambda_theta / (avg_lambda_target + 1e-8)
 
-                # Fetch Prodigy Schedule-Free dynamic learning rate correctly
-                group = opt.param_groups[0]
-                d_val = group.get('d', 1.0)
-                effective_lr = group.get('effective_lr', group.get('lr', 1.0))
-                current_lr = d_val * effective_lr
+                # MuonWithAuxAdam has two groups: Muon group then aux-Adam group.
+                muon_lr = opt.param_groups[0].get('lr', 0.0)
+                adam_lr = opt.param_groups[1].get('lr', 0.0) if len(opt.param_groups) > 1 else 0.0
 
-                logger.info(f"(step={train_steps:07d}) Loss: {avg_loss:.4f} (Flow: {avg_loss_flow:.4f}, Jump: {avg_loss_jump:.4f}), L_lam: {avg_loss_jump_lambda:.4f}, L_mu: {avg_loss_jump_mu:.4f}, lam: {avg_lambda_theta:.2f}/{avg_lambda_target:.2f}, mae: {avg_mae:.2f}, LR: {current_lr:.2e}")
+                logger.info(
+                    f"(step={train_steps:07d}) Loss: {avg_loss:.4f} "
+                    f"(Flow: {avg_loss_flow:.4f}, Jump: {avg_loss_jump:.4f}), "
+                    f"lam: {avg_lambda_theta:.2f}/{avg_lambda_target:.2f} "
+                    f"(ratio {avg_lambda_ratio:.2f}), "
+                    f"jump_var: {avg_jump_var_theta:.3f}/{avg_jump_var_target:.3f}, "
+                    f"jump_rmse: {avg_jump_rmse:.2f}, Muon LR: {muon_lr:.2e}, Adam LR: {adam_lr:.2e}"
+                )
                 if args.wandb:
                     wandb_utils.log(
                         {
                             "train loss": avg_loss,
                             "train loss flow": avg_loss_flow,
                             "train loss jump": avg_loss_jump,
-                            "train loss jump lambda": avg_loss_jump_lambda,
-                            "train loss jump mu": avg_loss_jump_mu,
-                            "train mae": avg_mae,
+                            "train jump rmse": avg_jump_rmse,
                             "train lambda theta": avg_lambda_theta,
                             "train lambda target": avg_lambda_target,
+                            "train lambda ratio": avg_lambda_ratio,
+                            "train jump var theta": avg_jump_var_theta,
+                            "train jump var target": avg_jump_var_target,
                             "train_steps_per_sec": steps_per_sec,
-                            "lr": current_lr
+                            "lr/muon": muon_lr,
+                            "lr/adam": adam_lr
                         },
                         step=train_steps
                     )
@@ -680,18 +849,16 @@ def main(args):
                 running_loss = 0
                 running_loss_flow = 0
                 running_loss_jump = 0
-                running_loss_jump_lambda = 0
-                running_loss_jump_mu = 0
-                running_mae = 0
+                running_jump_rmse = 0
                 running_lambda_theta = 0
                 running_lambda_target = 0
+                running_jump_var_theta = 0
+                running_jump_var_target = 0
                 log_steps = 0
                 start_time = time()
 
             # Save checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                # Schedule-Free: must call opt.eval() before saving model weights
-                opt.eval()
                 model.eval()
 
                 # Save Accelerate state (model, optimizer, dataloader, RNG)
@@ -727,21 +894,25 @@ def main(args):
                     if hasattr(unwrapped_model, "_orig_mod"):
                         unwrapped_model = unwrapped_model._orig_mod
 
-                    standalone_path = os.path.join(ckpt_dir, "model.pt")
-                    torch.save(unwrapped_model.state_dict(), standalone_path)
-                    logger.info(
-                        f"Saved checkpoint to {ckpt_dir} (Accelerate state + model.pt)")
+                    # Save EMA model if present (sufficient for Diffusion Transformers evaluation)
+                    if ema_model is not None:
+                        ema_state_dict = ema_model.state_dict()
+                        # Save in .safetensors format only
+                        from safetensors.torch import save_file
+                        save_file(ema_state_dict, os.path.join(ckpt_dir, "ema.safetensors"), metadata={"format": "pt"})
+                        
+                        logger.info(f"Saved checkpoint to {ckpt_dir} (Accelerate state + ema.safetensors)")
+                    else:
+                        logger.warning(f"Saved checkpoint to {ckpt_dir} (Accelerate state only; No EMA model found!)")
 
                 accelerator.wait_for_everyone()
                 model.train()
-                opt.train()  # Schedule-Free: switch back to training mode
                 # Exclude checkpoint I/O time from subsequent step/sec measurement.
                 log_steps = 0
                 start_time = time()
 
             if train_steps % args.sample_every == 0 and train_steps > 0:
                 logger.info("Generating samples...")
-                opt.eval()
                 model.eval()
                 with torch.no_grad():
                     # Force sampling labels to come from real training labels.
@@ -806,14 +977,12 @@ def main(args):
                 if args.wandb and out_samples is not None and is_main:
                     wandb_utils.log_image(out_samples, train_steps)
                 model.train()
-                opt.train()
                 logger.info("Generating samples done.")
                 # Exclude sampling/visualization time from subsequent step/sec measurement.
                 log_steps = 0
                 start_time = time()
 
     model.eval()
-    opt.eval()
 
     logger.info("Done!")
     accelerator.end_training()
@@ -860,6 +1029,35 @@ if __name__ == "__main__":
                         help="Mixed precision training. Defaults to 'no' or what's in 'accelerate launch'.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Number of steps to accumulate gradients before updating.")
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable torch.compile() for faster GPU kernel fusion.")
+    parser.add_argument("--compile-mode", type=str, default="reduce-overhead",
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile mode. 'reduce-overhead' suits fixed-shape training loops.")
+    parser.add_argument("--muon-lr", type=float, default=0.01,
+                        help="Learning rate for Muon parameter group (2D hidden weights).")
+    parser.add_argument("--muon-momentum", type=float, default=0.95,
+                        help="Momentum for Muon parameter group.")
+    parser.add_argument("--muon-weight-decay", type=float, default=0.0,
+                        help="Weight decay for Muon parameter group.")
+    parser.add_argument("--aux-adam-lr", type=float, default=1e-4,
+                        help="Learning rate for Aux-Adam parameter group.")
+    parser.add_argument("--aux-adam-beta1", type=float, default=0.9,
+                        help="Beta1 for Aux-Adam parameter group.")
+    parser.add_argument("--aux-adam-beta2", type=float, default=0.95,
+                        help="Beta2 for Aux-Adam parameter group.")
+    parser.add_argument("--aux-adam-eps", type=float, default=1e-10,
+                        help="Epsilon for Aux-Adam parameter group.")
+    parser.add_argument("--aux-adam-weight-decay", type=float, default=0.0,
+                        help="Weight decay for Aux-Adam parameter group.")
+    parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True,
+                        help="Maintain an EMA copy of model weights during training.")
+    parser.add_argument("--ema-decay", type=float, default=0.999,
+                        help="EMA decay factor.")
+    parser.add_argument("--ema-resume", action=argparse.BooleanOptionalAction, default=True,
+                        help="Load EMA weights from checkpoint during resume.")
+    parser.add_argument("--sample-use-ema", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use EMA weights for periodic sampling during training.")
 
     parse_transport_args(parser)
     args = parser.parse_args()

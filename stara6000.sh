@@ -20,14 +20,13 @@ CKPT_PATH="${3:-}"
 # Config:   SiT-XL/2, num_bins=128, jump_range=3.0
 # Batch:    128 per GPU (= 1024 global across 8 GPUs)
 # Precision: FP32 (Full Precision)
-# New Args:  Uses cubic time schedule and specific flow sampling args
+# New Args:  Uses the current fixed linear CondOT setup
 # -------------------------------------------------------------------
 
 NUM_GPUS=8
 GLOBAL_BATCH=768
 MODEL="SiT-XL/2"
 SAMPLER_TYPE="jump_flow"
-TIME_SCHEDULE="linear"
 # Keep workers conservative by default for stability on shared/NFS setups.
 # You can override: NUM_WORKERS=2 bash stara6000.sh ...
 NUM_WORKERS=8
@@ -118,7 +117,7 @@ echo "=========================================="
 echo " SiT-GM-moe Training on 48GB x${NUM_GPUS}"
 echo " Feature Data: $FEATURE_PATH"
 echo " Results: $RESULTS_DIR"
-echo " Model:   $MODEL ($TIME_SCHEDULE schedule)"
+echo " Model:   $MODEL"
 echo " Global BS: $GLOBAL_BATCH  (${NUM_GPUS} GPUs × $((GLOBAL_BATCH / NUM_GPUS))/GPU)"
 echo " Sampler: $SAMPLER_TYPE"
 echo " Max train samples: $MAX_TRAIN_SAMPLES"
@@ -136,7 +135,6 @@ accelerate launch --num_processes=$NUM_GPUS --mixed_precision=bf16 \
     --global-batch-size $GLOBAL_BATCH \
     --num-workers $NUM_WORKERS \
     --sampler-type $SAMPLER_TYPE \
-    --time-schedule $TIME_SCHEDULE \
     --epochs 1400000000 \
     --log-every 10 \
     --ckpt-every 5000 \

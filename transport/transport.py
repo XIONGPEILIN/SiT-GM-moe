@@ -50,7 +50,6 @@ class Transport:
         loss_type,
         train_eps,
         sample_eps,
-        time_schedule="linear",
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -63,7 +62,6 @@ class Transport:
         self.path_sampler = path_options[path_type]()
         self.train_eps = train_eps
         self.sample_eps = sample_eps
-        self.time_schedule = time_schedule
 
     def prior_logp(self, z):
         '''
@@ -94,8 +92,7 @@ class Transport:
             t1 = 1 - eps if (not sde or last_step_size ==
                              0) else 1 - last_step_size
 
-        elif (type(self.path_sampler) in [path.ICPlan, path.GVPCPlan]) \
-                and (self.model_type != ModelType.VELOCITY or sde):  # avoid numerical issue by taking a first semi-implicit step
+        elif (type(self.path_sampler) in [path.ICPlan, path.GVPCPlan]):  # avoid endpoint singularities on CondOT-style paths
 
             t0 = eps if (
                 diffusion_form == "SBDM" and sde) or self.model_type != ModelType.VELOCITY else 0
@@ -115,9 +112,49 @@ class Transport:
 
         x0 = th.randn_like(x1)
         t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
-        t = th.rand((x1.shape[0],)) * (t1 - t0) + t0
+        t = th.rand((x1.shape[0],), device=x1.device) * (t1 - t0) + t0
         t = t.to(x1)
+
         return t, x0, x1
+
+    def _condot_jump_gaussian_stats(self, z, t_expand):
+        """Exact first and second moments of the CondOT landing kernel.
+
+        For p_t(y|z)=N(tz, (1-t)^2), the exact landing kernel is
+        J_t(y|z) ∝ [-k_t(y|z)]_+ p_t(y|z).
+        In standardized coordinates y = tz + (1-t) eps, this becomes
+        q_z(eps) ∝ [1 + z eps - eps^2]_+ phi(eps),
+        which admits closed-form first and second moments on the support
+        [a(z), b(z)] where a,b are the roots of eps^2 - z eps - 1 = 0.
+        """
+        z64 = z.to(th.float64)
+        t64 = t_expand.to(th.float64)
+        sigma = 1.0 - t64
+        sqrt_two = np.sqrt(2.0)
+        normalizer = 1.0 / np.sqrt(2.0 * np.pi)
+
+        root = th.sqrt(z64.square() + 4.0)
+        a = 0.5 * (z64 - root)
+        b = 0.5 * (z64 + root)
+
+        phi_a = normalizer * th.exp(-0.5 * a.square())
+        phi_b = normalizer * th.exp(-0.5 * b.square())
+        cdf_a = 0.5 * (1.0 + th.erf(a / sqrt_two))
+        cdf_b = 0.5 * (1.0 + th.erf(b / sqrt_two))
+
+        mass = cdf_b - cdf_a
+        diff_pdf = phi_a - phi_b
+        Z = b * phi_a - a * phi_b
+
+        mean_eps = (z64 * mass - 2.0 * diff_pdf) / (Z + 1e-12)
+        second_eps = (
+            -2.0 * mass + (2.0 * b - a) * phi_a + (b - 2.0 * a) * phi_b
+        ) / (Z + 1e-12)
+        var_eps = second_eps - mean_eps.square()
+
+        mu = t64 * z64 + sigma * mean_eps
+        var = sigma.square() * var_eps + 1e-8
+        return mu.to(z.dtype), var.to(z.dtype)
 
     def training_losses(
         self,
@@ -146,71 +183,106 @@ class Transport:
         C_in = xt.shape[1]
 
         if self.model_type == ModelType.VELOCITY:
-            # Model output layout: [flow_u | gauss_mu | intensity]
+            # Model output layout: [flow_u | jump_d | jump_rho_raw]
             u_theta = model_output[:, :C_in]
-            mu_theta = model_output[:, C_in:2*C_in]
-            intensity_logits = model_output[:, 2*C_in:3*C_in]
+            jump_d_theta = model_output[:, C_in:2*C_in]
+            jump_rho_raw_theta = model_output[:, 2*C_in:3*C_in]
 
             terms = {}
             terms['pred'] = u_theta
 
-            # Flow loss uses mean per user request
+            # 1. Flow Loss: True Bregman Divergence (Appendix J)
+            # GM theory requires D(a,b) = phi(a) - phi(b) - phi'(b)*(a - b).
+            # If we just do cosh(a-b)-1, it's not a Bregman Divergence and Generator Matching fails!
+            # Let a = ut (target), b = u_theta (prediction). diff = u_theta - ut = b - a.
+            # Then a - b = -diff, and phi'(b) = alpha * sinh(alpha * u_theta).
             diff = u_theta - ut
             breg_type = getattr(self, 'bregman_type', 'mse')
+            alpha = getattr(self, 'bregman_alpha', 1.0)
+
             if breg_type == 'cosh':
-                L_flow = (th.cosh(diff) - 1).mean()
+                D_cosh = th.cosh(alpha * ut) - th.cosh(alpha *
+                                                       u_theta) + alpha * th.sinh(alpha * u_theta) * diff
+                L_flow = (0.5 * (diff ** 2) + 0.5 * D_cosh).mean()
             elif breg_type == 'exp':
-                L_flow = (th.exp(diff) - diff - 1).mean()
+                D_exp = th.exp(alpha * ut) - th.exp(alpha * u_theta) + \
+                    alpha * th.exp(alpha * u_theta) * diff
+                L_flow = (0.5 * (diff ** 2) + 0.5 * D_exp).mean()
             else:
                 L_flow = (diff ** 2).mean()
 
             # CondOT Jump 解析解 (GM 论文 Eq. 2596)
+            # 彻底摒弃外部除以 (1-t)^3 的隐患，将奇异权重剥离到分布对数散度之外
             k_t = xt**2 - (t_expand + 1) * xt * x1 - \
                 (1 - t_expand)**2 + t_expand * x1**2
-            lambda_target = th.clamp(k_t, min=0.0) / ((1 - t_expand)**3 + 1e-8)
-            # Relax the artificial clamp from 500 to a safer bound that allows sharp jumps near t=0.999
-            lambda_target = th.clamp(lambda_target, max=100000.0)
-            lambda_target_masked = lambda_target
 
-            # Extract lambda intensity: Use EXP instead of SOFTPLUS (Crucial!)
-            # Softplus with Poisson NLL has a bounded downward gradient (max 1), causing it to get "stuck" at high values.
-            # Exp() is the natural link function for Poisson, providing symmetric restoring force: grad = lambda_theta - lambda_target.
-            # max=15.0 ensures lambda maxes around ~3.2M, providing enough dynamic range
-            clamped_logits = th.clamp(intensity_logits, min=-8.0, max=15.0)
-            lambda_theta = th.exp(clamped_logits)
+            # 1. 提取物理真实的核心分子特征量 (rho) + Scaled Log1p (软化保护)
+            # 针对真值在 0.08~0.14 的特性，采用带缩放的 Log1p: y = s * log(1 + x/s)
+            # s=4.0 意味着在 x < 4.0 的宽广范围内保持近似线性，仅抑制极端的数值爆发
+            # 这比纯 log1p (s=1) 更能保留纹理细节，同时防止梯度爆炸
+            scale = 4.0
+            target_rho = scale * th.log1p(th.relu(k_t) / scale)
+            
+            # 2. 算子提取外部绝对共轭时间权重 W_t = 1 / (1-t)^3
+            # 在损失函数最外侧，我们将 W_t 限幅在 500 以规避 $t \to 1$ 时的无穷大乘数
+            remaining = th.clamp(1 - t_expand, min=1e-8)
+            raw_weight = 1.0 / (remaining**3)
+            safe_weight = th.clamp(raw_weight, max=10000.0)
 
-            # The Jump Ground Truth target is simply the un-noised data x1
-            target_y = x1
+            target_mu_jump, target_var_jump = self._condot_jump_gaussian_stats(
+                x1, t_expand)
+            jump_mu_theta = xt + remaining * jump_d_theta
 
-            # Define Jump Loss
-            # 1. Intensity Match: Poisson Bregman divergence (strictly >= 0)
-            # According to the CGM paper (Appendix E.3, Eq 2117-2120),
-            # The exact Bregman divergence for the Poisson jump kernel is:
-            # D(target, pred) = pred - target * log(pred) - (target - target * log(target))
-            # The last constant shift is formally part of the divergence definition.
-            poisson_min = lambda_target_masked - lambda_target_masked * \
-                th.log(lambda_target_masked + 1e-8)
-            loss_lambda = (lambda_theta - lambda_target_masked *
-                           clamped_logits - poisson_min).mean()
+            clamped_rho_raw = th.clamp(jump_rho_raw_theta, min=-20.0, max=12.0)
+            rho_theta = th.exp(clamped_rho_raw)
 
-            # 2. Laplace MAE (L1) (GM theory: Bregman divergence on Laplace kernel)
-            # We fix the Laplace scale `b` to the physical standard deviation (1-t)
-            # and ignore predicting the variance, resolving variance collapse completely.
-            b_t = (1.0 - t_expand) + 1e-8
-            l1_raw = th.abs(mu_theta - target_y)
-            loss_laplace_mu = l1_raw / b_t
+            jump_diff = jump_mu_theta - target_mu_jump
 
-            loss_jump_mu = (lambda_target_masked * loss_laplace_mu).mean()
-            L_jump_raw = loss_lambda + loss_jump_mu
+            # 3. Factorized Poisson Divergence (剥离端点后的纯散度测度)
+            # Mathematical equivalence proven:
+            # L = lambda_theta - lambda_target + lambda_target * log(lambda_target / lambda_theta) 
+            #   = W_t * [ rho_theta - target_rho + target_rho * log(target_rho / rho_theta) ]
+            divergence_rho = (
+                rho_theta
+                - target_rho
+                + target_rho * th.log((target_rho + 1e-8) / (rho_theta + 1e-8))
+            )
+            loss_lambda = (safe_weight * divergence_rho).mean()
+            
+            # Generator Matching paper formulation & Target Variance Matching:
+            # 强制剔除输出 var，网路不再猜测已知的分布方差，阻断 Variance Escape。
+            pred_var = target_var_jump
+            
+            # 由于 pred_var == target_var_jump，KL 散度原本形式如下：
+            # 0.5 * (log(target_var) - log(target_var) + (target_var + jump_diff^2) / target_var - 1)
+            # 全面化简后等于：0.5 * (jump_diff^2 / target_var) = Gaussian NLL with true var!
+            loss_jump_kl = 0.5 * (jump_diff.square() / (target_var_jump + 1e-8))
+            
+            # 同样地，把乘数 lambda_target 转换为 (safe_weight * target_rho)
+            loss_jump_distribution = (safe_weight * target_rho * loss_jump_kl).mean()
+            L_jump = loss_lambda + loss_jump_distribution
 
+            # For Logging 
             terms['loss_flow'] = L_flow
-            terms['loss_jump'] = L_jump_raw
+            terms['loss_jump'] = L_jump
             terms['loss_jump_lambda'] = loss_lambda
-            terms['loss_jump_mu'] = loss_jump_mu
-            terms['lambda_theta'] = lambda_theta.mean().detach()
-            terms['lambda_target'] = lambda_target_masked.mean().detach()
-            terms['mae'] = l1_raw.mean().detach()
-            terms['loss'] = L_flow + L_jump_raw
+            terms['loss_jump_mu'] = (safe_weight * target_rho * 0.5 * jump_diff.square() / (target_var_jump + 1e-8)).mean()
+            terms['loss_jump_var'] = th.zeros_like(terms['loss_jump_mu']) # Deprecated metric
+            
+            # Log the un-scaled rho values directly to observe internal network convergence
+            terms['lambda_theta'] = rho_theta.mean().detach()
+            terms['lambda_target'] = target_rho.mean().detach()
+            terms['jump_var_theta'] = pred_var.mean().detach()
+            terms['jump_var_target'] = target_var_jump.mean().detach()
+
+            # Fix: calculate jump_rmse ONLY over the active support region (where target_rho > 0)
+            active_mask = (target_rho > 0).float()
+            active_sum = active_mask.sum().clamp(min=1.0)
+            weighted_mse = (jump_diff.square() * active_mask).sum() / active_sum
+            terms['jump_rmse'] = th.sqrt(weighted_mse.detach() + 1e-12)
+
+            # 严格使用 Markov Superposition 原理下的 1:1 比重 (0.5 Flow + 0.5 Jump)
+            terms['loss'] = 0.5 * L_flow + 0.5 * L_jump
 
         else:
             B, *_, C = xt.shape
@@ -240,7 +312,8 @@ class Transport:
         return terms
 
     def get_drift(
-        self
+        self,
+        jump_alpha=0.5,
     ):
         """member function for obtaining the drift of the probability flow ODE"""
         def score_ode(x, t, model, **model_kwargs):
@@ -265,7 +338,10 @@ class Transport:
             model_output = model(x, t, **model_kwargs)
             if model_output.shape[1] > x.shape[1]:
                 model_output = model_output[:, :x.shape[1]]  # Extract u_theta
-            return model_output
+            
+            # For Jump-Flow models, the continuous flow velocity u_theta 
+            # is only responsible for (1 - jump_alpha) of the transport.
+            return (1.0 - jump_alpha) * model_output
 
         if self.model_type == ModelType.NOISE:
             drift_fn = noise_ode
@@ -284,7 +360,7 @@ class Transport:
     def get_score(
         self,
     ):
-        """member function for obtaining score of 
+        """member function for obtaining score of
             x_t = alpha_t * x + sigma_t * eps"""
         if self.model_type == ModelType.NOISE:
             def _score_fn(x, t, model, **kwargs):
@@ -455,18 +531,20 @@ class Sampler:
         atol=1e-6,
         rtol=1e-3,
         reverse=False,
+        jump_alpha=0.5,
     ):
         """returns a sampling function with given ODE settings
         Args:
         - sampling_method: type of sampler used in solving the ODE; default to be Dopri5
-        - num_steps: 
+        - num_steps:
             - fixed solver (Euler, Heun): the actual number of integration steps performed
             - adaptive solver (Dopri5): the number of datapoints saved during integration; produced by interpolation
         - atol: absolute error tolerance for the solver
         - rtol: relative error tolerance for the solver
         - reverse: whether solving the ODE in reverse (data to noise); default to False
+        - jump_alpha: the alpha parameter used for continuous flow scaling
         """
-        drift = self.drift
+        drift = self.transport.get_drift(jump_alpha=jump_alpha)
 
         t0, t1 = self.transport.check_interval(
             self.transport.train_eps,
@@ -495,13 +573,15 @@ class Sampler:
         num_steps=250,
         pure_jump=False,
         stochastic_jump=True,
+        jump_y_noise_scale=1.0,
         jump_alpha=0.5,
     ):
-        """returns a sampling function for mixed CTMC/SDE (Algorithm 2) - Euler MS method
+        """returns a sampling function for Jump+Flow Markov superposition with Euler updates
         Args:
         - num_steps: the actual number of integration steps performed
         - pure_jump: if True, sets jump_alpha to 1.0
         - stochastic_jump: if True, adds noise to jump landing point
+        - jump_y_noise_scale: scale multiplier for the jump std implied by Q_theta
         - jump_alpha: weight of the jump component
         """
 
@@ -532,17 +612,11 @@ class Sampler:
                 model_output = model(x, t_vec, **model_kwargs)
                 out_channels = model_output.shape[1]
 
-                # Laplace Jump-Flow [flow | mu | intensity]
+                # Normalized jump-flow layout: [flow_u | jump_d | jump_rho_raw]
                 if out_channels == 3 * C:
                     v_theta_flow = model_output[:, :C]
-                    mu_theta = model_output[:, C:2*C]
-                    intensity = model_output[:, 2*C:3*C]
-                # Legacy Gaussian Jump-Flow [flow | mu | intensity | logvar]
-                elif out_channels == 4 * C:
-                    v_theta_flow = model_output[:, :C]
-                    mu_theta = model_output[:, C:2*C]
-                    intensity = model_output[:, 2*C:3*C]
-                    # log_var = model_output[:, 3*C:4*C] (unused in pure inference usually)
+                    jump_d_theta = model_output[:, C:2*C]
+                    jump_rho_raw_theta = model_output[:, 2*C:3*C]
                 elif out_channels == C:  # Pure velocity / ODE model
                     v_theta_flow = model_output
                     x = x + v_theta_flow * dt
@@ -552,38 +626,53 @@ class Sampler:
                     raise RuntimeError(
                         f"Unexpected model output channels: {out_channels} for input channels: {C}")
 
-                lambda_t = th.exp(th.clamp(intensity, -8, 15.0))
+                remaining = th.clamp(th.tensor(1.0 - t, device=x.device, dtype=x.dtype), min=1e-8)
+                remaining_next = max(1.0 - t - dt, 0.0)
 
-                # Approximate the integral of lambda_t
-                integral = 0.5 * lambda_t * \
-                    (1.0 - t) * (1.0 - ((1.0 - t)**2 / ((1.0 - t - dt)**2 + 1e-8)))
-                p_jump = 1.0 - th.exp(jump_alpha * integral)
-                p_jump = th.clamp(p_jump, 0.0, 1.0)
+                jump_mu = x + remaining * jump_d_theta
+
+                # CondOT 理论动态方差：由预测的 x1_hat 分析逼近
+                # x_t = t * x1 + (1-t) * x0 ==> 求解 x1 且利用 v_theta_flow (等同于 x1 - x0 积分速度)
+                x1_hat = x + remaining * v_theta_flow
+                t_vec_expand = path.expand_t_like_x(t_vec, x)
+                _, target_var_jump = self.transport._condot_jump_gaussian_stats(x1_hat, t_vec_expand)
+                jump_var = target_var_jump
+
+                jump_rho_raw = th.clamp(jump_rho_raw_theta, min=-20.0, max=12.0)
+                jump_rho = th.exp(jump_rho_raw)
+                lambda_t = jump_rho / ((remaining ** 3) + 1e-8)
+
+                # Approximate the integral of lambda_t over [t, t+dt]
+                hazard = 0.5 * jump_alpha * lambda_t * remaining * (
+                    (remaining ** 2) / ((remaining_next ** 2) + 1e-8) - 1.0
+                )
+                p_jump = -th.expm1(-hazard)
 
                 is_cfg = "cfg_scale" in model_kwargs
                 if is_cfg:
                     half_N = x.shape[0] // 2
                     p_jump_half = p_jump[:half_N]
                     jump_mask_half = th.bernoulli(p_jump_half)
-                    jump_mask = th.cat([jump_mask_half, jump_mask_half], dim=0)
+                    jump_mask = th.cat([jump_mask_half, jump_mask_half], dim=0).bool()
                 else:
-                    jump_mask = th.bernoulli(p_jump)
+                    jump_mask = th.bernoulli(p_jump).bool()
 
+                # Compute candidates
                 x_flow = x + (1.0 - jump_alpha) * v_theta_flow * dt
 
                 if stochastic_jump:
-                    # Use the physical, fixed scale (1-t) instead of the dead prediction `log_var`
-                    std = max(1.0 - t, 0.0)
+                    std = th.sqrt(jump_var) * jump_y_noise_scale
                     if is_cfg:
                         noise_half = th.randn_like(x[:half_N])
                         noise = th.cat([noise_half, noise_half], dim=0)
-                        x_jump = mu_theta + std * noise
+                        x_jump = jump_mu + std * noise
                     else:
-                        x_jump = mu_theta + std * th.randn_like(x)
+                        x_jump = jump_mu + std * th.randn_like(x)
                 else:
-                    x_jump = mu_theta
+                    x_jump = jump_mu
 
-                x = jump_mask * x_jump + (1 - jump_mask) * x_flow
+                # Update samples
+                x = th.where(jump_mask, x_jump, x_flow)
                 xs.append(x)
 
             return xs
@@ -599,8 +688,6 @@ class Sampler:
         """Predictor-Corrector sampling (Euler predictor + Langevin corrector)"""
         return self.sample_jump_flow(
             num_steps=num_steps,
-            corrector_steps=corrector_steps,
-            snr=snr,
         )
 
     def sample_ode_likelihood(
