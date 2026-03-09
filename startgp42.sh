@@ -3,9 +3,9 @@
 set -e
 export CUDA_VISIBLE_DEVICES=4,5,6,7
 NUM_GPUS=4
-FEATURE_PATH="${1:-/home/yanai-lab/xiong-p/SiT-GM-moe/imagenet_feature}"
-RESULTS_DIR="${2:-results_a100/gp42-training}"
-CKPT_PATH="${3:-results_a100/gp42-training/059-SiT-XL-2-Linear-velocity-None/checkpoints/0005000/ema.pt}"
+FEATURE_PATH="/home/yanai-lab/xiong-p/SiT-GM-moe/imagenet_feature"
+RESULTS_DIR="results_a100/gp42-training-full"
+# CKPT_PATH="${3:-results_a100/gp42-training/059-SiT-XL-2-Linear-velocity-None/checkpoints/0005000/ema.pt}"
 
 # -------------------------------------------------------------------
 # Batch Size Calculation:
@@ -13,24 +13,31 @@ CKPT_PATH="${3:-results_a100/gp42-training/059-SiT-XL-2-Linear-velocity-None/che
 # Global Batch is calculated without gradient accumulation steps.
 # -------------------------------------------------------------------
 
-BATCH_PER_GPU=50
+BATCH_PER_GPU=30
 GLOBAL_BATCH=$((BATCH_PER_GPU * NUM_GPUS * 16))
 
 MODEL="SiT-XL/2"
 SAMPLER_TYPE="jump_flow"
 NUM_WORKERS=4
-# DATASET_REPEAT=10000
-# MAX_TRAIN_SAMPLES=64
+DATASET_REPEAT=10
+# MAX_TRAIN_SAMPLES=
 
 # MuonWithAuxAdam tuning knobs (Optimized via online research)
-MUON_LR="0.02"
+MUON_LR="0.1"
 MUON_MOMENTUM="0.95"
+
 MUON_WD="0.01"
-AUX_ADAM_LR="0.0003"
-AUX_ADAM_BETA1="0.9"
-AUX_ADAM_BETA2="0.95"
-AUX_ADAM_EPS="1e-8"
 AUX_ADAM_WD="0.01"
+
+AUX_ADAM_LR="0.001"
+EMBED_LR="0.001"
+HEAD_LR="0.001"
+
+AUX_ADAM_BETA1="0.95"
+AUX_ADAM_BETA2="0.99"
+AUX_ADAM_EPS="1e-8"
+
+GRAD_CLIP_NORM="0"
 EMA="true"
 EMA_DECAY="0.999"
 SAMPLE_USE_EMA="true"
@@ -65,12 +72,6 @@ export XDG_CACHE_HOME="$USER_TMP/xdg_cache"
 # -------------------------------------------------------------------
 export NCCL_ALGO="Ring"
 export NCCL_P2P_LEVEL=5
-export NCCL_SYMMETRIC_MEMORY=1
-export NCCL_CE_THRESHOLD=1
-export NCCL_BUFFSIZE=4194304
-export NCCL_IB_DISABLE=1
-export NCCL_SOCKET_IFNAME=lo
-export NCCL_DEBUG=WARN
 
 echo "=========================================="
 echo " SiT-GM-moe Training on Blackwell 96GB x${NUM_GPUS}"
@@ -119,30 +120,30 @@ accelerate launch --num_processes=$NUM_GPUS --mixed_precision=bf16 $DEEPSPEED_AR
     --global-batch-size $GLOBAL_BATCH \
     --num-workers $NUM_WORKERS \
     --sampler-type $SAMPLER_TYPE \
-    --max-train-samples $MAX_TRAIN_SAMPLES \
     --epochs 1400000000 \
     --log-every 1 \
     --ckpt-every 5000 \
+    --wandb \
     --sample-every 1000000000000000000 \
     --cfg-scale 1 \
-    --wandb \
-    --gradient_accumulation_steps 1 \
+    --gradient_accumulation_steps 8 \
     --dataset-repeat $DATASET_REPEAT \
-    --compile \
     --compile-mode max-autotune \
     --muon-lr "$MUON_LR" \
     --muon-momentum "$MUON_MOMENTUM" \
     --muon-weight-decay "$MUON_WD" \
+    --embed-lr "$EMBED_LR" \
+    --head-lr "$HEAD_LR" \
+    --grad-clip-norm "$GRAD_CLIP_NORM" \
     --aux-adam-lr "$AUX_ADAM_LR" \
     --aux-adam-beta1 "$AUX_ADAM_BETA1" \
     --aux-adam-beta2 "$AUX_ADAM_BETA2" \
     --aux-adam-eps "$AUX_ADAM_EPS" \
     --aux-adam-weight-decay "$AUX_ADAM_WD" \
-    --gradient-checkpointing \
     $EMA_FLAG \
     --ema-decay "$EMA_DECAY" \
     $SAMPLE_USE_EMA_FLAG \
-    --bregman-type cosh \
+    --bregman-type mse \
     $CKPT_ARG \
     --no-ema-resume \
     $RESUME_ARG

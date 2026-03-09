@@ -189,6 +189,10 @@ def main(mode, args):
         class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
         print(f"Using default fallback labels: {class_labels}")
     
+    if args.limit > 0:
+        class_labels = class_labels[:args.limit]
+        print(f"Limited to first {args.limit} labels.")
+
     if not class_labels:
         print(f"No labels for rank {args.rank}, exiting.")
         return
@@ -257,6 +261,7 @@ if __name__ == "__main__":
     parser.add_argument("--rank", type=int, default=0, help="Rank of the current worker")
     parser.add_argument("--world-size", type=int, default=1, help="Total number of workers")
 
+    parser.add_argument("--limit", type=int, default=0, help="Limit the number of images to generate")
     parse_transport_args(parser)
     if mode == "ODE":
         parse_ode_args(parser)

@@ -25,15 +25,26 @@ from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader
 import torch
+import torch.distributed as dist
 from accelerate import Accelerator
-from accelerate.utils import set_seed, DummyOptim
+from accelerate.utils import set_seed
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True # 开启 cuDNN 自带的算法搜索
 import torch._inductor.config as inductor_config
 
+
+#################################################################################
+#                             Optimizer Functions                               #
+#################################################################################
+
+try:
+    from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
+except ImportError:
+    # Fallback placeholder if not installed
+    MuonWithAuxAdam = None
+    SingleDeviceMuonWithAuxAdam = None
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -335,9 +346,47 @@ def main(args):
         jump_range=getattr(args, 'jump_range', 4.0),
     )
 
-    # Print model detail and cuDNN status
+    # Print model detail and backend status
     print(f"\n{'='*50}\nModel Data Type: {next(model.parameters()).dtype}\n{'='*50}")
-    print(f"\n{'#'*50}\n# cuDNN Enabled: {torch.backends.cudnn.enabled}\n{'#'*50}\n")
+
+    # Since we are not using torch.compile, we are in Eager Mode
+    print(f"\n{'#'*50}")
+    print(f"# Execution Mode: Eager Mode (Standard PyTorch)")
+    print(f"# cuDNN Enabled: {torch.backends.cudnn.enabled}")
+    print(f"# cuDNN Version: {torch.backends.cudnn.version()}")
+    print(f"# Note: Standard cuDNN/cuBLAS kernels are used for acceleration.")
+    print(f"{'#'*50}\n")
+
+    # Check Attention Suitability based on PyTorch Blog
+    gpu_name = torch.cuda.get_device_name(device)
+    is_blackwell = "Blackwell" in gpu_name or "B100" in gpu_name or "B200" in gpu_name
+    is_hopper = "H100" in gpu_name or "H200" in gpu_name
+    
+    print(f"\n{'#'*50}")
+    print("# Attention Interface Suitability Check (Ref: pytorch.org/blog/flexattention-flashattention-4)")
+    print(f"{'#'*50}")
+    print(f"# GPU: {gpu_name}")
+    print("# Model Attention Pattern: Standard Bidirectional (Dense/Noop)")
+    print("# Analysis:")
+    
+    if is_blackwell:
+        print("#  [CRITICAL] Blackwell GPU detected.")
+        print("#  - Insight: Triton-based FlexAttention is significantly slower on Blackwell.")
+        print("#  - Insight: 'FlexAttention (Flash Backend) matches cuDNN performance for Noop'.")
+        print("#  - Insight: 'Forward pass: Noop matches cuDNN closely'.")
+        print("#")
+        print("#  >>> RECOMMENDATION: Use SDPA (current default) OR FlexAttention with BACKEND='FLASH'.")
+        print("#      Do NOT use Triton backend for FlexAttention.")
+    elif is_hopper:
+        print("#  [INFO] Hopper GPU detected.")
+        print("#  - Insight: FlashAttention-3/4 provides best performance.")
+        print("#  >>> RECOMMENDATION: SDPA (uses FlashAttn internally) or FlexAttention (FLASH backend).")
+    else:
+        print("#  [INFO] Pre-Hopper GPU detected.")
+        print("#  - Insight: Standard SDPA or FlashAttention-2 is sufficient.")
+    
+    print(f"{'#'*50}\n")
+
     if args.gradient_checkpointing and hasattr(model, "set_gradient_checkpointing"):
         model.set_gradient_checkpointing(True)
         logger.info("Enabled gradient checkpointing.")
@@ -352,68 +401,68 @@ def main(args):
     elif args.sampler_type == "jump_flow":
         print("Training BOTH flow and jump heads.")
 
-    # Tag parameters for DeepSpeed Muon support
+    # Filter parameters for layered learning rates (standard format for muon library)
+    muon_params = []
+    embedding_params = []
+    head_params = []
+    aux_adam_params = []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if p.ndim >= 2 and "embed" not in name and "final_layer" not in name:
-            p.use_muon = True
-        else:
-            p.use_muon = False
-
-    # Filter parameters for layered learning rates (used in standard AdamW or non-Muon DS)
-    muon_params = [p for p in model.parameters() if p.requires_grad and getattr(p, "use_muon", False)]
-    adam_params = [p for p in model.parameters() if p.requires_grad and not getattr(p, "use_muon", False)]
-    
-    # Even more fine-grained for standard AdamW
-    embedding_params = []
-    head_params = []
-    other_adam_params = []
-    for name, p in model.named_parameters():
-        if not p.requires_grad or getattr(p, "use_muon", False):
-            continue
+        
         if "embed" in name:
             embedding_params.append(p)
         elif "final_layer" in name:
             head_params.append(p)
+        elif p.ndim >= 2:
+            muon_params.append(p)
         else:
-            other_adam_params.append(p)
+            aux_adam_params.append(p)
 
+    # Re-organize into official param_groups format
     param_groups = [
-        {"params": muon_params, "lr": args.muon_lr, "weight_decay": args.muon_weight_decay},
-        {"params": embedding_params, "lr": args.embed_lr, "weight_decay": args.aux_adam_weight_decay},
-        {"params": head_params, "lr": args.head_lr, "weight_decay": args.aux_adam_weight_decay},
-        {"params": other_adam_params, "lr": args.aux_adam_lr, "weight_decay": args.aux_adam_weight_decay, "betas": (args.aux_adam_beta1, args.aux_adam_beta2), "eps": args.aux_adam_eps},
+        {
+            "params": muon_params, 
+            "lr": args.muon_lr, 
+            "momentum": args.muon_momentum, 
+            "weight_decay": args.muon_weight_decay, 
+            "use_muon": True
+        },
+        {
+            "params": embedding_params, 
+            "lr": args.embed_lr, 
+            "betas": (args.aux_adam_beta1, args.aux_adam_beta2), 
+            "eps": args.aux_adam_eps, 
+            "weight_decay": args.aux_adam_weight_decay, 
+            "use_muon": False
+        },
+        {
+            "params": head_params, 
+            "lr": args.head_lr, 
+            "betas": (args.aux_adam_beta1, args.aux_adam_beta2), 
+            "eps": args.aux_adam_eps, 
+            "weight_decay": args.aux_adam_weight_decay, 
+            "use_muon": False
+        },
+        {
+            "params": aux_adam_params, 
+            "lr": args.aux_adam_lr, 
+            "betas": (args.aux_adam_beta1, args.aux_adam_beta2), 
+            "eps": args.aux_adam_eps, 
+            "weight_decay": args.aux_adam_weight_decay, 
+            "use_muon": False
+        },
     ]
 
-    # Setup optimizer:
-    if accelerator.state.deepspeed_plugin is not None:
-        ds_config = accelerator.state.deepspeed_plugin.deepspeed_config
-        is_ds_muon = ds_config.get("optimizer", {}).get("type") == "Muon"
-        
-        # Manually fill "auto" fields in DeepSpeed config
-        if "optimizer" in ds_config and "params" in ds_config["optimizer"]:
-            ds_params = ds_config["optimizer"]["params"]
-            if ds_params.get("muon_lr") == "auto": ds_params["muon_lr"] = args.muon_lr
-            if ds_params.get("adam_lr") == "auto": ds_params["adam_lr"] = args.aux_adam_lr
-            if ds_params.get("lr") == "auto": ds_params["lr"] = args.muon_lr
-            if ds_params.get("weight_decay") == "auto": ds_params["weight_decay"] = args.muon_weight_decay
-            if ds_params.get("momentum") == "auto": ds_params["momentum"] = args.muon_momentum
-
-        if is_ds_muon:
-            # DeepSpeed's built-in Muon DOES NOT support param_groups (list of dicts).
-            # It expects a flat list of parameters and uses the .use_muon attribute.
-            opt = DummyOptim(model.parameters())
-            logger.info("Initialized DeepSpeed Muon (built-in) via DummyOptim(model.parameters()). "
-                        f"Note: embed_lr and head_lr are ignored in this mode; using aux_adam_lr={args.aux_adam_lr}")
-        else:
-            # Other DeepSpeed optimizers (like AdamW) DO support param_groups.
-            opt = DummyOptim(param_groups)
-            logger.info("Initialized DeepSpeed optimizer via DummyOptim(param_groups). Layered LRs supported.")
+    # Initialize the official hybrid optimizer
+    if accelerator.num_processes > 1:
+        opt = MuonWithAuxAdam(param_groups)
+        logger.info(f"Initialized Distributed MuonWithAuxAdam (momentum={args.muon_momentum})")
     else:
-        # Standard PyTorch training
-        opt = torch.optim.AdamW(param_groups)
-        logger.info(f"Initialized AdamW with layered LRs: Muon={args.muon_lr}, Embed={args.embed_lr}, Head={args.head_lr}, Aux={args.aux_adam_lr}")
+        opt = SingleDeviceMuonWithAuxAdam(param_groups)
+        logger.info(f"Initialized SingleDeviceMuonWithAuxAdam (momentum={args.muon_momentum})")
+    
+    logger.info(f"Layered LRs: Muon: {args.muon_lr}, Embed: {args.embed_lr}, Head: {args.head_lr}, Aux: {args.aux_adam_lr}")
 
     # Resume from Accelerate checkpoint directory
     train_steps = 0
@@ -653,16 +702,14 @@ def main(args):
 
     # Prepare with Accelerate (handles DDP wrapping, device placement, dataloader sharding)
     model, opt, loader = accelerator.prepare(model, opt, loader)
-
-    # Check and log the actual model precision and cuDNN status in a very prominent way
+    
+    # Check and log the actual model precision in a very prominent way
     if is_main:
         try:
             model_dtype = next(model.parameters()).dtype
-            cudnn_available = torch.backends.cudnn.is_available()
-            cudnn_enabled = torch.backends.cudnn.enabled
-            logger.info("\n" + "="*80 + f"\n\n    ACTUAL MODEL PRECISION: {model_dtype}\n    CUDNN AVAILABLE: {cudnn_available}\n    CUDNN ENABLED: {cudnn_enabled}\n\n" + "="*80 + "\n")
+            logger.info("\n" + "="*80 + f"\n\n    ACTUAL MODEL PRECISION: {model_dtype}\n\n" + "="*80 + "\n")
         except Exception as e:
-            logger.warning(f"Could not determine model info: {e}")
+            logger.warning(f"Could not determine model dtype: {e}")
 
     # Enable gradient communication compression hook (massive PCIe bandwidth savings)
     if accelerator.num_processes > 1 and hasattr(model, 'register_comm_hook'):
@@ -818,23 +865,6 @@ def main(args):
                 running_jump_var_target += loss_dict["jump_var_target"].item()
             log_steps += 1
             train_steps += 1
-
-            if train_steps == 1 and accelerator.is_main_process:
-                for i, g in enumerate(opt.param_groups):
-                    print(
-                        f"Group {i}: use_muon={g.get('use_muon')}, "
-                        f"lr={g.get('lr')}, momentum={g.get('momentum')}, "
-                        f"keys={list(g.keys())}"
-                    )
-                # Check whether model parameters retain use_muon tag.
-                for name, p in model.named_parameters():
-                    if p.requires_grad:
-                        print(
-                            f"  {name}: use_muon={getattr(p, 'use_muon', 'MISSING')}, "
-                            f"ndim={p.ndim}"
-                        )
-                        break
-
             if train_steps % args.log_every == 0:
                 # Measure training speed:
                 torch.cuda.synchronize()
@@ -1083,8 +1113,10 @@ if __name__ == "__main__":
                         help="Learning rate for Embedding parameter group.")
     parser.add_argument("--head-lr", type=float, default=0.004,
                         help="Learning rate for the final output layer group.")
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0,
+                        help="Global norm for gradient clipping. Set <= 0 to disable clipping.")
     parser.add_argument("--aux-adam-lr", type=float, default=1e-4,
-                        help="Learning rate for Aux-Adam parameter group (norms, biases).")
+                        help="Learning rate for Aux-Adam parameter group.")
     parser.add_argument("--aux-adam-beta1", type=float, default=0.9,
                         help="Beta1 for Aux-Adam parameter group.")
     parser.add_argument("--aux-adam-beta2", type=float, default=0.95,
@@ -1093,8 +1125,6 @@ if __name__ == "__main__":
                         help="Epsilon for Aux-Adam parameter group.")
     parser.add_argument("--aux-adam-weight-decay", type=float, default=0.0,
                         help="Weight decay for Aux-Adam parameter group.")
-    parser.add_argument("--grad-clip-norm", type=float, default=1.0,
-                        help="Global norm for gradient clipping. Set <= 0 to disable clipping.")
     parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True,
                         help="Maintain an EMA copy of model weights during training.")
     parser.add_argument("--ema-decay", type=float, default=0.999,

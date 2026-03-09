@@ -224,10 +224,13 @@ class Transport:
             target_rho = scale * th.log1p(th.relu(k_t) / scale)
             
             # 2. 算子提取外部绝对共轭时间权重 W_t = 1 / (1-t)^3
-            # 在损失函数最外侧，我们将 W_t 限幅在 500 以规避 $t \to 1$ 时的无穷大乘数
+            # 使用代数平滑 (Algebraic Smooth Clamping) 替代硬截断 clamp
+            # 公式: W_safe = 1 / ( (1-t)^3 + 1/M )
+            # 优势: 处处可导，前期完美贴合理论权重，后期平滑收敛至 M，消除梯度转折点
+            # 设定最大渐近线 M = 1000.0 (兼顾训练稳定与 250 步采样的高保真度)
+            max_weight_asymptote = 1000.0
             remaining = th.clamp(1 - t_expand, min=1e-8)
-            raw_weight = 1.0 / (remaining**3)
-            safe_weight = th.clamp(raw_weight, max=10000.0)
+            safe_weight = 1.0 / (remaining**3 + (1.0 / max_weight_asymptote))
 
             target_mu_jump, target_var_jump = self._condot_jump_gaussian_stats(
                 x1, t_expand)
@@ -339,9 +342,7 @@ class Transport:
             if model_output.shape[1] > x.shape[1]:
                 model_output = model_output[:, :x.shape[1]]  # Extract u_theta
             
-            # For Jump-Flow models, the continuous flow velocity u_theta 
-            # is only responsible for (1 - jump_alpha) of the transport.
-            return (1.0 - jump_alpha) * model_output
+            return model_output
 
         if self.model_type == ModelType.NOISE:
             drift_fn = noise_ode
@@ -612,27 +613,23 @@ class Sampler:
                 model_output = model(x, t_vec, **model_kwargs)
                 out_channels = model_output.shape[1]
 
-                # Normalized jump-flow layout: [flow_u | jump_d | jump_rho_raw]
                 if out_channels == 3 * C:
                     v_theta_flow = model_output[:, :C]
                     jump_d_theta = model_output[:, C:2*C]
                     jump_rho_raw_theta = model_output[:, 2*C:3*C]
-                elif out_channels == C:  # Pure velocity / ODE model
+                elif out_channels == C:
                     v_theta_flow = model_output
                     x = x + v_theta_flow * dt
                     xs.append(x)
                     continue
                 else:
-                    raise RuntimeError(
-                        f"Unexpected model output channels: {out_channels} for input channels: {C}")
+                    raise RuntimeError(f"Unexpected model output channels: {out_channels}")
 
                 remaining = th.clamp(th.tensor(1.0 - t, device=x.device, dtype=x.dtype), min=1e-8)
                 remaining_next = max(1.0 - t - dt, 0.0)
 
                 jump_mu = x + remaining * jump_d_theta
-
-                # CondOT 理论动态方差：由预测的 x1_hat 分析逼近
-                # x_t = t * x1 + (1-t) * x0 ==> 求解 x1 且利用 v_theta_flow (等同于 x1 - x0 积分速度)
+                
                 x1_hat = x + remaining * v_theta_flow
                 t_vec_expand = path.expand_t_like_x(t_vec, x)
                 _, target_var_jump = self.transport._condot_jump_gaussian_stats(x1_hat, t_vec_expand)
@@ -642,7 +639,6 @@ class Sampler:
                 jump_rho = th.exp(jump_rho_raw)
                 lambda_t = jump_rho / ((remaining ** 3) + 1e-8)
 
-                # Approximate the integral of lambda_t over [t, t+dt]
                 hazard = 0.5 * jump_alpha * lambda_t * remaining * (
                     (remaining ** 2) / ((remaining_next ** 2) + 1e-8) - 1.0
                 )
@@ -657,7 +653,6 @@ class Sampler:
                 else:
                     jump_mask = th.bernoulli(p_jump).bool()
 
-                # Compute candidates
                 x_flow = x + (1.0 - jump_alpha) * v_theta_flow * dt
 
                 if stochastic_jump:
@@ -671,7 +666,6 @@ class Sampler:
                 else:
                     x_jump = jump_mu
 
-                # Update samples
                 x = th.where(jump_mask, x_jump, x_flow)
                 xs.append(x)
 

@@ -245,10 +245,10 @@ class SiT(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
-        # Keep the flow head zero-initialized for stable ODE behavior.
-        nn.init.constant_(self.final_layer_flow.adaLN_modulation[-1].weight, 0)
+        # Use random init for flow head to avoid zero-output cold start.
+        nn.init.normal_(self.final_layer_flow.adaLN_modulation[-1].weight, std=0.02)
         nn.init.constant_(self.final_layer_flow.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer_flow.linear.weight, 0)
+        nn.init.xavier_uniform_(self.final_layer_flow.linear.weight)
         nn.init.constant_(self.final_layer_flow.linear.bias, 0)
 
 
@@ -404,6 +404,8 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 def SiT_XL_2(**kwargs):
     return SiT(depth=30, hidden_size=2880, patch_size=2, num_heads=24, **kwargs)
+def SiT_XL_2_org(**kwargs):
+    return SiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
 
 def SiT_XL_4(**kwargs):
@@ -451,7 +453,7 @@ def SiT_S_8(**kwargs):
 
 
 SiT_models = {
-    'SiT-XL/2': SiT_XL_2,  'SiT-XL/4': SiT_XL_4,  'SiT-XL/8': SiT_XL_8,
+    'SiT-XL/2': SiT_XL_2,  'SiT-XL/2-org': SiT_XL_2_org,  'SiT-XL/4': SiT_XL_4,  'SiT-XL/8': SiT_XL_8,
     'SiT-L/2':  SiT_L_2,   'SiT-L/4':  SiT_L_4,   'SiT-L/8':  SiT_L_8,
     'SiT-B/2':  SiT_B_2,   'SiT-B/4':  SiT_B_4,   'SiT-B/8':  SiT_B_8,
     'SiT-S/2':  SiT_S_2,   'SiT-S/4':  SiT_S_4,   'SiT-S/8':  SiT_S_8,

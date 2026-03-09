@@ -1,17 +1,17 @@
 {
     "fp16": {
-        "enabled": "auto"
+        "enabled": false
     },
     "bf16": {
-        "enabled": "auto"
+        "enabled": false
     },
     "zero_optimization": {
         "stage": 1,
         "allgather_partitions": true,
-        "allgather_bucket_size": 2e8,
+        "allgather_bucket_size": 1e9,
         "overlap_comm": true,
         "reduce_scatter": true,
-        "reduce_bucket_size": 2e8,
+        "reduce_bucket_size": 1e9,
         "contiguous_gradients": true
     },
     "optimizer": {
@@ -22,7 +22,7 @@
             "adam_lr": "auto",
             "weight_decay": "auto",
             "momentum": 0.95,
-            "betas": [0.95, 0.99],
+            "betas": [0.9, 0.95],
             "eps": 1e-8,
             "ns_steps": 5
         }
